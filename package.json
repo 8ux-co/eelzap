@@ -1,0 +1,111 @@
+{
+  "name": "@8ux-co/eelzap",
+  "version": "0.10.0",
+  "description": "The Eel Zap client: typed content delivery and writes, stega-aware field helpers, Next.js and React preview helpers, and the on-demand preview overlay.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/8ux-co/eelzap.git"
+  },
+  "homepage": "https://github.com/8ux-co/eelzap#readme",
+  "bugs": {
+    "url": "https://github.com/8ux-co/eelzap/issues"
+  },
+  "keywords": [
+    "eelzap",
+    "cms",
+    "headless",
+    "typescript",
+    "sdk",
+    "preview"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./fields": {
+      "import": {
+        "types": "./dist/fields.d.ts",
+        "default": "./dist/fields.js"
+      },
+      "require": {
+        "types": "./dist/fields.d.cts",
+        "default": "./dist/fields.cjs"
+      }
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "default": "./dist/next.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "default": "./dist/react.js"
+    },
+    "./preview": {
+      "types": "./dist/preview.d.ts",
+      "default": "./dist/preview.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:cov": "vitest run --coverage",
+    "docs": "typedoc",
+    "clean": "rm -rf dist coverage .turbo docs",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "next": ">=14",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@vitest/coverage-v8": "^3.2.4",
+    "esbuild": "^0.27.7",
+    "jsdom": "^29.1.1",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "tsup": "^8.5.0",
+    "typedoc": "^0.28.13",
+    "typedoc-plugin-markdown": "^4.9.0",
+    "typescript": "5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "module": "./dist/index.js"
+}
