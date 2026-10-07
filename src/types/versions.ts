@@ -88,6 +88,7 @@ export interface VersionSeo {
   ogType: string | null
   ogImageId: string | null
   ogImageAlt: string | null
+  /** As stored: a path (`/blog/x`) or a full URL; null when unset. */
   canonicalUrl: string | null
   twitterCard: string
   noIndex: boolean

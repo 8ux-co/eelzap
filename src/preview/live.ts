@@ -262,6 +262,7 @@ export function initZap(options: InitZapOptions, runtimeOptions: RuntimeOptions 
   const exact = dev ? [ZAP_PRODUCTION_ORIGIN, dev] : [ZAP_PRODUCTION_ORIGIN]
 
   let helloOk = false
+  const draftRoute = isDraftRoutePath(options.draftRoute) ? options.draftRoute : null
   const runtime = startRuntime(
     {
       editorOrigins: exact,
@@ -269,7 +270,7 @@ export function initZap(options: InitZapOptions, runtimeOptions: RuntimeOptions 
         const candidate = parentOriginHint(win)
         return candidate && exact.includes(candidate) ? [candidate] : exact
       },
-      draftRoute: isDraftRoutePath(options.draftRoute) ? options.draftRoute : null,
+      draftRoute,
       pageUrl: () => win.location.href,
       lazyOverlay: true,
       accept: (message) => {
@@ -285,8 +286,20 @@ export function initZap(options: InitZapOptions, runtimeOptions: RuntimeOptions 
           // last one: a stale token must not keep serving drafts.
           try {
             const token = message.payload.previewToken
-            if (token) sessionStore(win)?.setItem(PREVIEW_TOKEN_STORAGE_KEY, token)
+            const store = sessionStore(win)
+            const last = store?.getItem(PREVIEW_TOKEN_STORAGE_KEY)
+            if (token) store?.setItem(PREVIEW_TOKEN_STORAGE_KEY, token)
             else forgetPreviewToken(win)
+            // The editor renewed the draft session ahead of its end: the new
+            // token goes through the site's draft route in the background,
+            // which sets the draft cookies again without navigating, so the
+            // next reload still reads drafts. The redirect is not followed.
+            if (token && last && last !== token && draftRoute) {
+              const query = new URLSearchParams({ token, path: win.location.pathname })
+              void win
+                .fetch(`${draftRoute}?${query}`, { credentials: 'same-origin', redirect: 'manual' })
+                .catch(() => {})
+            }
           } catch {
             // Storage blocked: the draft-mode cookie is the only path left.
           }
@@ -337,6 +350,7 @@ function startSuggestions(options: InitZapOptions, win: Window, devZap: string |
     locale: options.locale,
     chunkBase: options.chunkBase,
     open: options.open,
+    draftRoute: isDraftRoutePath(options.draftRoute) ? options.draftRoute : null,
   })
   stopSuggestions = stop
   return {

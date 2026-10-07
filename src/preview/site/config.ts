@@ -54,6 +54,12 @@ export interface StartOptions {
   reason?: 'expired' | 'trigger' | 'renewed'
   /** signin: finish a full-page sign-in that landed on this page. */
   callback?: CallbackParams
+  /**
+   * signin: start signing in at once, as if «Entrar con Eel» was pressed.
+   * Passed by «Volver a entrar» (the bar's expired state), inside its click, so
+   * the popup is still allowed.
+   */
+  signIn?: boolean
 }
 
 export interface ChunkHandle {
@@ -81,6 +87,12 @@ export interface SiteContext {
   locale: 'es' | 'en'
   /** The letter pressed with Shift to open the tools, for the launcher's hint; false when off. */
   shortcut: string | false
+  /**
+   * The site's draft-mode route (`/api/zap-preview` by default), as the page
+   * announced it: «Editar» enters draft mode through it on an untagged page
+   * (`draft-session.ts`). Null or absent when the site has none.
+   */
+  draftRoute?: string | null
   /** Replace whatever chunk is showing with `name`. */
   open(name: ChunkName, options?: StartOptions): Promise<void>
   /** Close the showing chunk; the trigger works again. */

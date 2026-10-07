@@ -1,3 +1,4 @@
+import { cleanStega } from '../stega'
 import {
   MAX_QUOTE_CONTEXT,
   MAX_QUOTE_EXACT,
@@ -123,9 +124,13 @@ function fit(selector: string): string | null {
   return utf8Length(selector) <= MAX_SELECTOR_BYTES ? selector : null
 }
 
-/** Collapse whitespace the way a reader sees text. */
+/**
+ * Collapse whitespace the way a reader sees text, without stega markers: an
+ * element's text in preview carries them, and they are never content (a
+ * quote, a «before» or a typed value read from the page must not store one).
+ */
 export function normalizeText(value: string): string {
-  return value.replace(/\s+/g, ' ').trim()
+  return cleanStega(value).replace(/\s+/g, ' ').trim()
 }
 
 /** W3C TextQuoteSelector-shaped quote: the element's text plus 32 chars around it. */

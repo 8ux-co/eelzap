@@ -271,6 +271,12 @@ export interface DraftModeExitRouteOptions {
  * partitioned cookie is only replaced by a partitioned one, so `disable()`
  * alone (Next's unpartitioned expiry) would leave the framed copy alive.
  * Redirects (307) to `?path=` when `safeRedirectPath` accepts it, else to `/`.
+ *
+ * Mount it at `{draftRoute}/exit` (`/api/zap-preview/exit` by default): the
+ * live-site toolbar's sign-out calls exactly that path to drop the draft
+ * cookie a draft session left (ADR 041 amendment 2026-10-06). Without it,
+ * signing out still revokes the session's tokens at Zap, and the cookie
+ * expires within its ten minutes.
  */
 export function createDraftModeExitRoute(options: DraftModeExitRouteOptions) {
   if (!options?.draftMode) throw new Error('eelzap/next: draftMode is required')

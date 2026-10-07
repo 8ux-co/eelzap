@@ -96,6 +96,8 @@ interface Box {
   element: Element
   kind: BoxKind
   label: string | null
+  /** A field of another record: «en Configuración», drawn muted after the label. */
+  suffix?: string
 }
 
 export class Overlay {
@@ -105,6 +107,7 @@ export class Overlay {
   private zoom = 1
   private theme: Required<OverlayTheme> = { ...DEFAULT_THEME }
   private labels: Record<string, string> = {}
+  private foreign: Record<string, [string, string]> = {}
   private hover: Element | null = null
   private focused: Element[] = []
   private highlighted: Element[] = []
@@ -169,6 +172,9 @@ export class Overlay {
       if (!(event as MouseEvent).relatedTarget) this.setHover(null)
     })
     this.listen(win, 'click', (event) => this.onClick(event as MouseEvent))
+    // While the overlay is on, the page never navigates away (Zap's preview
+    // frame; the live site's Editar and Comentar): no form is submitted.
+    this.listen(win, 'submit', (event) => this.mode !== 'off' && this.consume(event))
     this.listen(win, 'keydown', (event) => this.onKey(event as KeyboardEvent))
     this.listen(win, 'scroll', () => this.schedule())
     this.listen(win, 'resize', () => this.schedule())
@@ -222,8 +228,10 @@ export class Overlay {
     this.schedule()
   }
 
-  setLabels(labels: Record<string, string>): void {
+  /** Labels by field key; `foreign`, by full tag, the fields of other records (`HelloPayload.foreign`). */
+  setLabels(labels: Record<string, string>, foreign: Record<string, [string, string]> = {}): void {
     this.labels = { ...labels }
+    this.foreign = { ...foreign }
     this.schedule()
   }
 
@@ -231,9 +239,7 @@ export class Overlay {
   focusField(elements: Element[]): number {
     this.focused = elements.slice()
     const first = elements[0]
-    if (first && typeof first.scrollIntoView === 'function') {
-      first.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    }
+    if (first) reveal(this.options.win, first)
     this.schedule()
     return elements.length
   }
@@ -242,9 +248,7 @@ export class Overlay {
   highlight(elements: Element[]): void {
     this.highlighted = elements.slice(0, MAX_ANCHORS)
     const first = this.highlighted[0]
-    if (first && typeof first.scrollIntoView === 'function') {
-      first.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    }
+    if (first) reveal(this.options.win, first)
     this.schedule()
   }
 
@@ -335,6 +339,8 @@ export class Overlay {
 
   private onClick(event: MouseEvent): void {
     if (this.mode === 'off' || this.isOwn(event.target)) return
+    // Nor does a link navigate; a tagged one still selects its field below.
+    if ((event.target as Element).closest?.('a[href],area[href]')) this.consume(event)
     if (this.mode === 'spot') {
       // The capture layer normally takes the click; anything that still lands
       // on the site (a synthetic click, a gap) is consumed the same way.
@@ -439,7 +445,8 @@ export class Overlay {
       if (seen.has(element) || !element.isConnected) return
       seen.add(element)
       const tagged = this.options.index.get(element)
-      boxes.push({ element, kind, label: tagged ? this.labelFor(tagged) : null })
+      const [label, suffix] = tagged ? this.labelFor(tagged) : [null]
+      boxes.push({ element, kind, label, suffix })
     }
     if (this.mode !== 'off') {
       for (const element of this.selected) add(element, 'selected')
@@ -469,6 +476,13 @@ export class Overlay {
       }
     }
     layer.replaceChildren(...nodes)
+    // Chips stay inside the viewport: measured once drawn, shifted in.
+    const inset = EDGE_PX / this.zoom
+    for (const chip of layer.querySelectorAll<HTMLElement>('.chip')) {
+      const { left, right } = chip.getBoundingClientRect()
+      const dx = Math.min(Math.max(0, inset - left), this.options.win.innerWidth - inset - right)
+      chip.style.transform = `translateX(${dx}px)`
+    }
   }
 
   /** A gold teardrop whose point (bottom-left) sits on `[x, y]`; without a pin, the pending one. */
@@ -477,9 +491,14 @@ export class Overlay {
     node.className = 'pin'
     const z = this.zoom
     const size = PIN_PX / z
+    const vw = this.options.win.innerWidth
+    // No room above a point on screen: the pin hangs below it, its tip up;
+    // near the right edge it shifts in.
+    const below = y >= 0 && y - size < EDGE_PX / z
+    if (below) node.style.borderRadius = '0 999px 999px'
     Object.assign(node.style, {
-      left: `${x}px`,
-      top: `${y - size}px`,
+      left: `${x <= vw ? Math.min(x, vw - size - EDGE_PX / z) : x}px`,
+      top: `${below ? y : y - size}px`,
       width: `${size}px`,
       height: `${size}px`,
       fontSize: `${11 / z}px`,
@@ -497,9 +516,9 @@ export class Overlay {
     return node
   }
 
-  private labelFor(tagged: TaggedElement): string {
-    const label = this.labels[tagged.fieldKey]
-    return typeof label === 'string' && label.trim() ? label : tagged.fieldKey
+  private labelFor(tagged: TaggedElement): [string, string?] {
+    const [label, suffix] = this.foreign[tagged.tag] ?? [this.labels[tagged.fieldKey]]
+    return [typeof label === 'string' && label.trim() ? label : tagged.fieldKey, suffix]
   }
 
   private drawBox(box: Box): HTMLElement {
@@ -534,9 +553,14 @@ export class Overlay {
     if (box.label && box.kind !== 'highlight' && !tooSmall) {
       const chip = doc.createElement('span')
       chip.className = 'chip'
+      // No room above the element: the chip goes below it (flip); the
+      // horizontal shift waits until it is drawn and measurable (render).
+      const lift = 27 / z
+      const above =
+        rect.top - offset - lift >= EDGE_PX / z || rect.bottom + lift > this.options.win.innerHeight
       Object.assign(chip.style, {
         right: px(-5),
-        top: px(-27),
+        [above ? 'top' : 'bottom']: px(-27),
         height: px(CHIP_HEIGHT_PX),
         padding: `0 ${px(7)}`,
         gap: px(4),
@@ -557,6 +581,12 @@ export class Overlay {
       // Label text is set with textContent: labels come from the editor and
       // are never parsed as markup.
       chip.appendChild(doc.createTextNode(box.label))
+      if (box.suffix) {
+        const muted = doc.createElement('span')
+        muted.className = 'of'
+        muted.textContent = box.suffix
+        chip.appendChild(muted)
+      }
       node.appendChild(chip)
     }
     return node
@@ -566,8 +596,22 @@ export class Overlay {
 /** `spotOnLarge`: an element taking this share of the viewport is commented as a point (site Comentar's rule). */
 const LARGE_SHARE = 0.5
 
+/**
+ * Scroll THIS window only, centring `element`; nothing when it is fully in
+ * view. Never `scrollIntoView`, which also scrolls every scrollable ancestor
+ * across the frame: Zap's editor around its preview frame.
+ */
+export function reveal(win: Window, element: Element): void {
+  const { top, bottom, height } = element.getBoundingClientRect()
+  const h = win.innerHeight
+  if (top < 0 || bottom > h)
+    win.scrollTo?.({ top: win.scrollY + top - Math.max(0, (h - height) / 2), behavior: 'smooth' })
+}
+
 /** The chip's on-screen height; a selected element smaller than this shows its chip on hover only. */
 const CHIP_HEIGHT_PX = 20
+/** How far chips and pins keep from the viewport's edges, on screen. */
+const EDGE_PX = 4
 /** A pin's on-screen size (SeleccionarElementos board, «Comentar»). */
 const PIN_PX = 22
 
@@ -579,6 +623,7 @@ const STYLES = `
   font-family: Poppins, ui-sans-serif, system-ui, sans-serif; font-weight: 600; line-height: 1;
   letter-spacing: 0; box-sizing: border-box;
 }
+.of { font-weight: 400; opacity: .72; }
 .capture { position: fixed; inset: 0; pointer-events: auto; cursor: crosshair; display: none; }
 .pin {
   position: fixed; box-sizing: border-box; pointer-events: auto; cursor: pointer; text-align: center;

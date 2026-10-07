@@ -1,11 +1,16 @@
 import type {
   WebhookAction,
   WebhookChange,
+  WebhookCollectionEventData,
   WebhookDocumentEventData,
   WebhookEventType,
   WebhookItemEventData,
   WebhookMediaEventData,
   WebhookPayload,
+  WebhookSchemaEventData,
+  WebhookSeoEventData,
+  WebhookSiteEventData,
+  WebhookSiteRef,
 } from './types/webhook'
 
 /*
@@ -161,10 +166,13 @@ export async function verifyWebhookSignature(
   return subtle.verify('HMAC', hmacKey, signatureBytes, encoder.encode(`${timestamp}.${payload}`))
 }
 
+/**
+ * The verbs of the content events that change what the live site serves.
+ * Not `draft_updated` (a draft is not live) and not `assigned`.
+ */
 const CHANGE_ACTIONS: ReadonlySet<string> = new Set<WebhookAction>([
   'created',
   'updated',
-  'draft_updated',
   'published',
   'unpublished',
   'deleted',
@@ -173,12 +181,41 @@ const CHANGE_ACTIONS: ReadonlySet<string> = new Set<WebhookAction>([
 ])
 
 /**
- * Flattens a Zap content event into one {@link WebhookChange} per item,
- * document or file it names — what a site walks to invalidate its cache.
- * Every other event (`ping`, schema, site, SEO, assignment, comment
- * events) yields an empty list.
+ * Flattens a Zap event into the {@link WebhookChange}s a site invalidates its
+ * cache by:
+ *
+ * - `zap.item.*`, `zap.document.*`, `zap.media.*`: one change per item,
+ *   document or file.
+ * - `zap.seo.updated`: one `item` or `document` change (action `updated`) per
+ *   entry or document whose SEO changed.
+ * - `zap.collection.*`: one `collection` change.
+ * - `zap.schema.field_changed` (action `field_changed`): one `collection`
+ *   change per collection whose fields changed, and one `document` change per
+ *   document whose fields changed, each named by its key. An older payload
+ *   without the keys names a collection by id (`resourceKey` is the id, no
+ *   `collectionKey`) and widens a document's fields to one `site` change.
+ * - `zap.site.updated`: one `site` change.
+ *
+ * Every other event yields an empty list: `ping`, drafts (`draft_updated`),
+ * assignments, comments, API keys, and sites created or deleted.
  */
 export function webhookChanges(payload: WebhookPayload): WebhookChange[] {
+  switch (payload.type) {
+    case 'zap.seo.updated':
+      return seoChanges(payload.data as WebhookSeoEventData)
+    case 'zap.collection.created':
+    case 'zap.collection.updated':
+    case 'zap.collection.deleted':
+      return collectionChanges(
+        payload.type.slice('zap.collection.'.length) as WebhookAction,
+        payload.data as WebhookCollectionEventData,
+      )
+    case 'zap.schema.field_changed':
+      return schemaChanges(payload.data as WebhookSchemaEventData)
+    case 'zap.site.updated':
+      return siteChanges('updated', payload.data as WebhookSiteEventData)
+  }
+
   const match = /^zap\.(item|document|media)\.([a-z_]+)$/.exec(payload.type)
   if (!match || !CHANGE_ACTIONS.has(match[2]!)) {
     return []
@@ -215,4 +252,97 @@ export function webhookChanges(payload: WebhookPayload): WebhookChange[] {
     resourceKey: media.id,
     siteKey: data.site.key,
   }))
+}
+
+/** An SEO change is a change to the entry or document it is on. */
+function seoChanges(data: WebhookSeoEventData): WebhookChange[] {
+  return (data.targets ?? []).map((target): WebhookChange => {
+    if (target.kind === 'item') {
+      return {
+        type: 'item',
+        action: 'updated',
+        id: target.id,
+        resourceKey: target.key,
+        ...(data.collection ? { collectionKey: data.collection.key } : {}),
+        siteKey: data.site.key,
+      }
+    }
+    return {
+      type: 'document',
+      action: 'updated',
+      id: target.id,
+      resourceKey: target.key,
+      siteKey: data.site.key,
+    }
+  })
+}
+
+function collectionChanges(
+  action: WebhookAction,
+  data: WebhookCollectionEventData,
+): WebhookChange[] {
+  if (!data.collection || !data.site) return []
+  return [
+    {
+      type: 'collection',
+      action,
+      id: data.collection.id,
+      resourceKey: data.collection.key,
+      collectionKey: data.collection.key,
+      siteKey: data.site.key,
+    },
+  ]
+}
+
+/**
+ * One change per owner, however many fields changed: a collection by its key,
+ * a document by its key. Payloads from before the keys were added name the
+ * owner by id only: a collection keeps its id, and fields of a document widen
+ * to the site.
+ */
+function schemaChanges(data: WebhookSchemaEventData): WebhookChange[] {
+  const changes: WebhookChange[] = []
+  const seen = new Set<string>()
+  for (const change of data.changes ?? []) {
+    if (change.collection_id) {
+      if (seen.has(`collection:${change.collection_id}`)) continue
+      seen.add(`collection:${change.collection_id}`)
+      const key = change.collection_key
+      changes.push({
+        type: 'collection',
+        action: 'field_changed',
+        id: change.collection_id,
+        resourceKey: key ?? change.collection_id,
+        ...(key ? { collectionKey: key } : {}),
+        siteKey: data.site.key,
+      })
+    } else if (change.document_id && change.document_key) {
+      if (seen.has(`document:${change.document_id}`)) continue
+      seen.add(`document:${change.document_id}`)
+      changes.push({
+        type: 'document',
+        action: 'field_changed',
+        id: change.document_id,
+        resourceKey: change.document_key,
+        siteKey: data.site.key,
+      })
+    } else if (change.document_id && !seen.has('site')) {
+      seen.add('site')
+      changes.push(...siteChanges('field_changed', data))
+    }
+  }
+  return changes
+}
+
+function siteChanges(action: WebhookAction, data: { site?: WebhookSiteRef }): WebhookChange[] {
+  if (!data.site) return []
+  return [
+    {
+      type: 'site',
+      action,
+      id: data.site.id,
+      resourceKey: data.site.key,
+      siteKey: data.site.key,
+    },
+  ]
 }

@@ -92,6 +92,14 @@ export interface SeoImage {
 export interface Seo {
   metaTitle: string | null
   metaDescription: string | null
+  /**
+   * Always an absolute URL, or null when the site has no URL or the record has
+   * no page (a document without a preview path is site-wide, such as a header
+   * and footer document). The record's own URL (the site URL plus its preview
+   * path, else `/{collectionKey}/{slug}` for an entry) unless an editor set
+   * one: a path set in Zap arrives resolved against the site URL, a full URL
+   * as typed.
+   */
   canonicalUrl: string | null
   ogUrl: string | null
   ogType: string | null
@@ -259,6 +267,13 @@ export interface SeoInput {
   ogType?: string | null
   ogImageId?: string | null
   ogImageAlt?: string | null
+  /**
+   * Optional, SEO only. A path starting with `/` (stored as sent and resolved
+   * against the site URL on delivery, so it follows a change of address) or a
+   * full https URL (http only on localhost), kept as sent. `null` or `''`
+   * clears it, and delivery falls back to the record's own URL. Never changes
+   * the page Zap's preview opens.
+   */
   canonicalUrl?: string | null
   twitterCard?: 'SUMMARY' | 'SUMMARY_LARGE_IMAGE'
   noIndex?: boolean

@@ -278,7 +278,12 @@ export interface OnPageComment {
 
 /** `onPage`: what the site's suggestion client needs on one page. */
 export interface OnPageComments {
-  viewer: { name: string | null }
+  /**
+   * The signed-in person: their own name and email, and `editorUrl`, the
+   * absolute Zap editor URL of the entry or document this page is (an entry
+   * first when several are), or null.
+   */
+  viewer: { name: string | null; email: string | null; editorUrl: string | null }
   /** Whether the site lets people save straight to the draft. */
   liveEditing: boolean
   /** Record ref → field key → field. */

@@ -761,20 +761,77 @@ never include comment text. Their types are `WebhookCommentCreatedData`,
 
 ### Cache invalidation
 
-`webhookChanges(payload)` flattens an item, document or media event into one
-`WebhookChange` per entry — `{ type, action, id, resourceKey, collectionKey?,
-siteKey }`, where `resourceKey` is the item's slug, the document's key or the
-file's id. Any other event gives an empty list.
+`webhookChanges(payload)` flattens an event into the changes a site
+revalidates by, `{ type, action, id, resourceKey, collectionKey?, siteKey }`:
+
+| `type`       | From                                                                    | `resourceKey`        | `collectionKey` |
+| ------------ | ----------------------------------------------------------------------- | -------------------- | --------------- |
+| `item`       | `zap.item.*`, and `zap.seo.updated` on entries (action `updated`)       | the entry's slug     | its collection  |
+| `document`   | `zap.document.*`, and `zap.seo.updated` on documents (action `updated`) | the document's key   |                 |
+| `document`   | `zap.schema.field_changed` on a document's fields (`field_changed`)     | the document's key   |                 |
+| `media`      | `zap.media.*`                                                           | the file's id        |                 |
+| `collection` | `zap.collection.*`                                                      | the collection's key | the same key    |
+| `collection` | `zap.schema.field_changed` on a collection's fields (`field_changed`)   | the collection's key | the same key    |
+| `site`       | `zap.site.updated`                                                      | the site's key       |                 |
+
+One event can name several entries, documents or files: each is its own
+change. A `collection` change means everything that shows that collection; a
+`site` change means the whole site. Drafts (`draft_updated`), assignments,
+comments, API keys, `ping`, and sites created or deleted give an empty list.
+
+A `zap.schema.field_changed` sent before the event carried `collection_key`
+and `document_key` names its owners by id only: a collection's fields give a
+`collection` change whose `resourceKey` is the collection's id, with no
+`collectionKey`, and a document's fields give one `site` change.
+
+#### Subscribing a live site
+
+Subscribe the site's webhook, narrowed to the site with `site_ids`, to:
+
+- the `zap.item.*`, `zap.document.*` and `zap.media.*` events, except
+  `zap.item.draft_updated`, `zap.document.draft_updated`, `zap.item.assigned`
+  and `zap.document.assigned`;
+- `zap.collection.created`, `zap.collection.updated` and
+  `zap.collection.deleted`;
+- `zap.seo.updated`, `zap.schema.field_changed` and `zap.site.updated`.
+
+Do not subscribe to `draft_updated` or `assigned`: a saved draft and a new
+Responsable change nothing the site serves, and drafts save often.
+
+#### Revalidating
+
+A Next.js route handler for a site that serves documents at `/<key>` and
+entries at `/<collection>/<slug>`:
 
 ```ts
+// app/api/zap-webhook/route.ts
+import { revalidatePath } from 'next/cache'
 import {
-  MemoryCacheAdapter,
   verifyWebhookSignature,
   webhookChanges,
+  type WebhookChange,
   type WebhookPayload,
 } from '@8ux-co/eelzap'
 
-const cache = new MemoryCacheAdapter()
+function revalidate(change: WebhookChange) {
+  switch (change.type) {
+    case 'item':
+      revalidatePath(`/${change.collectionKey}/${change.resourceKey}`)
+      revalidatePath(`/${change.collectionKey}`) // the listing
+      return
+    case 'document':
+      revalidatePath(`/${change.resourceKey}`)
+      return
+    case 'collection':
+      // An older field change without the key names the collection by id: refresh the whole site.
+      revalidatePath(change.collectionKey ? `/${change.collectionKey}` : '/', 'layout')
+      return
+    case 'media':
+    case 'site':
+      revalidatePath('/', 'layout')
+      return
+  }
+}
 
 export async function POST(request: Request) {
   const payload = await request.text()
@@ -785,12 +842,15 @@ export async function POST(request: Request) {
   }
 
   for (const change of webhookChanges(JSON.parse(payload) as WebhookPayload)) {
-    if (change.type === 'document') cache.delete(change.resourceKey)
-    if (change.type === 'item') cache.delete(`${change.collectionKey}:${change.resourceKey}`)
+    revalidate(change)
   }
   return new Response('ok')
 }
 ```
+
+With `cachedFetch` and a `MemoryCacheAdapter`, do the same with
+`cache.delete(key)` for an item or a document, and `cache.clear()` for a
+`collection`, `media` or `site` change.
 
 `WEBHOOK_SIGNATURE_HEADER`, `WEBHOOK_TIMESTAMP_HEADER` and
 `WEBHOOK_TOLERANCE_SECONDS` export the header names and the default window.

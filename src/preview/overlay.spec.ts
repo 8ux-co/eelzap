@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { Overlay, OVERLAY_HOST_TAG } from './overlay'
+import { Overlay, OVERLAY_HOST_TAG, reveal } from './overlay'
 import { TagIndex } from './tags'
 
 function setup(html: string, extra: { spotOnLarge?: boolean } = {}) {
@@ -42,7 +42,25 @@ function click(element: Element, init: MouseEventInit = {}) {
 afterEach(() => {
   while (overlays.length) overlays.pop()!.destroy()
   document.body.innerHTML = ''
+  vi.restoreAllMocks()
 })
+
+/** jsdom lays nothing out: the box `element` reports, in viewport px. */
+function placed(element: Element, top: number, height: number, width = 300) {
+  vi.spyOn(element, 'getBoundingClientRect').mockReturnValue({
+    x: 0,
+    y: top,
+    left: 0,
+    top,
+    right: width,
+    bottom: top + height,
+    width,
+    height,
+  } as DOMRect)
+}
+
+/** The closed shadow root's drawing layer, which `inspect()` summarises. */
+const layerOf = (overlay: Overlay) => (overlay as unknown as { layer: HTMLElement }).layer
 
 const PAGE = `
   <h1 data-zap="blog/hola#title">Hola</h1>
@@ -213,13 +231,35 @@ describe('Overlay', () => {
   it('focusField outlines every element of the field and scrolls to the first', () => {
     const { overlay, index } = setup(`${PAGE}<h2 data-zap="blog/hola#title">Hola otra vez</h2>`)
     overlay.setMode('inspect')
-    const scroll = vi.fn()
+    const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
     const elements = index.byField('blog/hola', 'title').map((t) => t.element)
-    elements[0]!.scrollIntoView = scroll
+    const scrollIntoView = vi.fn()
+    elements[0]!.scrollIntoView = scrollIntoView
+    // Below the fold (jsdom's viewport is 768px tall): centred, this window only.
+    placed(elements[0]!, 1000, 40)
     expect(overlay.focusField(elements)).toBe(2)
     overlay.render()
     expect(overlay.inspect().boxes.map((b) => b.kind)).toEqual(['focus', 'focus'])
-    expect(scroll).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' })
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: 1000 - (window.innerHeight - 40) / 2,
+      behavior: 'smooth',
+    })
+    expect(scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('highlight scrolls this window to the first anchor, never scrollIntoView', () => {
+    const { overlay } = setup(PAGE)
+    overlay.setMode('inspect')
+    const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
+    const scrollIntoView = vi.fn()
+    $('#foot').scrollIntoView = scrollIntoView
+    placed($('#foot'), 2000, 20)
+    overlay.highlight([$('#foot')])
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: 2000 - (window.innerHeight - 20) / 2,
+      behavior: 'smooth',
+    })
+    expect(scrollIntoView).not.toHaveBeenCalled()
   })
 
   it('a located field carries its chip (CampoLocalizar); a highlighted anchor does not', () => {
@@ -235,6 +275,96 @@ describe('Overlay', () => {
     expect(overlay.inspect().boxes).toEqual([{ kind: 'highlight', label: null }])
   })
 
+  it('a click on or inside a link never navigates while the overlay is on; off leaves it alone', () => {
+    const { overlay, onInspect } = setup(`${PAGE}
+      <a id="out" href="/otra"><span id="in">Ir</span></a>
+      <a id="cta" href="/x" data-zap="blog/hola#cta">CTA</a>
+      <map name="m"><area id="spot" href="/y" alt="y"></map>
+      <a id="bare">Sin destino</a>`)
+    const site = vi.fn()
+    document.body.addEventListener('click', site)
+    for (const mode of ['inspect', 'select', 'spot'] as const) {
+      overlay.setMode(mode)
+      for (const target of ['#in', '#out', '#spot']) {
+        const event = click($(target))
+        expect([mode, target, event.defaultPrevented]).toEqual([mode, target, true])
+      }
+    }
+    expect(site).not.toHaveBeenCalled()
+
+    // A tagged link still names its field in inspect mode.
+    overlay.setMode('inspect')
+    expect(click($('#cta')).defaultPrevented).toBe(true)
+    expect(onInspect).toHaveBeenCalledWith(expect.objectContaining({ tag: 'blog/hola#cta' }))
+    // An anchor without href is no link: an untagged one passes through.
+    expect(click($('#bare')).defaultPrevented).toBe(false)
+
+    overlay.setMode('off')
+    for (const target of ['#in', '#cta', '#spot']) {
+      expect(click($(target)).defaultPrevented).toBe(false)
+    }
+    expect(site).toHaveBeenCalledTimes(4)
+    document.body.removeEventListener('click', site)
+  })
+
+  it('no form is submitted while the overlay is on; off leaves it alone', () => {
+    const { overlay } = setup(`${PAGE}<form id="f"><button>Enviar</button></form>`)
+    const submit = () => {
+      const event = new Event('submit', { bubbles: true, cancelable: true })
+      $('#f').dispatchEvent(event)
+      return event.defaultPrevented
+    }
+    for (const mode of ['inspect', 'select', 'spot'] as const) {
+      overlay.setMode(mode)
+      expect([mode, submit()]).toEqual([mode, true])
+    }
+    overlay.setMode('off')
+    expect(submit()).toBe(false)
+  })
+
+  it("a field of another record names its record after the label, muted; the page's own does not", () => {
+    const { overlay } = setup(
+      `${PAGE}<p id="news" data-zap="doc:configuracion#boletin_titulo">Boletín</p>`,
+    )
+    overlay.setLabels(
+      // The page's own labels are by field key: never a foreign field's.
+      { title: 'Título', boletin_titulo: 'Etiqueta propia' },
+      { 'doc:configuracion#boletin_titulo': ['Título del boletín', 'en Configuración'] },
+    )
+    overlay.setMode('inspect')
+    hover($('#news'))
+    overlay.render()
+    expect(overlay.inspect().boxes).toEqual([
+      { kind: 'hover', label: 'Título del boletínen Configuración' },
+    ])
+    const chip = layerOf(overlay).querySelector('.chip')!
+    expect(chip.firstChild!.textContent).toBe('Título del boletín')
+    expect(chip.querySelector('span.of')!.textContent).toBe('en Configuración')
+
+    hover($('h1'))
+    overlay.render()
+    expect(overlay.inspect().boxes).toEqual([{ kind: 'hover', label: 'Título' }])
+    expect(layerOf(overlay).querySelector('.of')).toBeNull()
+
+    const css = (layerOf(overlay).parentNode as ShadowRoot).querySelector('style')!.textContent!
+    expect(css).toMatch(/\.of\s*\{\s*font-weight:\s*400;\s*opacity:\s*\.72;\s*\}/)
+  })
+
+  it('a chip with no room above its element flips below it', () => {
+    const { overlay } = setup(PAGE)
+    overlay.setLabels({ title: 'Título', subtitle: 'Subtítulo' })
+    overlay.setMode('inspect')
+    const chipStyle = () => layerOf(overlay).querySelector<HTMLElement>('.chip')!.style
+    placed($('h1'), 0, 40) // flush with the top of the viewport
+    hover($('h1'))
+    overlay.render()
+    expect([chipStyle().top, chipStyle().bottom]).toEqual(['', '-27px'])
+    placed($('p'), 200, 40) // room above: the chip sits on top
+    hover($('#inner'))
+    overlay.render()
+    expect([chipStyle().top, chipStyle().bottom]).toEqual(['-27px', ''])
+  })
+
   it('renders labels as text, never markup', () => {
     const { overlay } = setup(PAGE)
     overlay.setLabels({ title: '<img src=x onerror=alert(1)>' })
@@ -242,6 +372,48 @@ describe('Overlay', () => {
     hover($('h1'))
     overlay.render()
     expect(overlay.inspect().boxes[0]!.label).toBe('<img src=x onerror=alert(1)>')
+  })
+})
+
+describe('reveal', () => {
+  function frame(scrollY = 300, innerHeight = 800) {
+    const scrollTo = vi.fn()
+    return { win: { innerHeight, scrollY, scrollTo } as unknown as Window, scrollTo }
+  }
+  function element(top: number, height: number) {
+    const el = document.createElement('div')
+    el.scrollIntoView = vi.fn()
+    placed(el, top, height)
+    return el
+  }
+
+  it('does nothing for an element fully in view, edges included', () => {
+    const { win, scrollTo } = frame()
+    for (const [top, height] of [
+      [0, 800],
+      [100, 200],
+      [760, 40],
+    ] as const) {
+      const el = element(top, height)
+      reveal(win, el)
+      expect(el.scrollIntoView).not.toHaveBeenCalled()
+    }
+    expect(scrollTo).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['below the fold', 1000, 100, 300 + 1000 - 350],
+    ['partly below', 750, 100, 300 + 750 - 350],
+    ['above', -500, 100, 300 - 500 - 350],
+    ['partly above', -10, 100, 300 - 10 - 350],
+    ['taller than the viewport: its top at the top', -10, 1200, 300 - 10],
+  ])('scrolls this window to centre an element %s', (_name, top, height, expected) => {
+    const { win, scrollTo } = frame()
+    const el = element(top, height)
+    reveal(win, el)
+    expect(scrollTo).toHaveBeenCalledTimes(1)
+    expect(scrollTo).toHaveBeenCalledWith({ top: expected, behavior: 'smooth' })
+    expect(el.scrollIntoView).not.toHaveBeenCalled()
   })
 })
 

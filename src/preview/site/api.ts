@@ -53,10 +53,20 @@ export interface OnPageComment {
 }
 
 export interface OnPage {
-  viewer: { name: string | null }
+  /**
+   * The caller's own name and email, and `editorUrl`: the absolute Zap editor
+   * URL of the record this page is, or null (optional: older Zaps omit both).
+   */
+  viewer: { name: string | null; email?: string | null; editorUrl?: string | null }
   /** Whether «Editar» is on for this site (the ADMIN's `liveEditing` switch). */
   liveEditing: boolean
   fields: Record<string, Record<string, FieldInfo>>
+  /**
+   * The tagged records that are not the record this page is, by ref, to
+   * their name: their fields read «… en Configuración» (optional: older
+   * Zaps omit it).
+   */
+  records?: Record<string, string>
   comments: OnPageComment[]
   truncated: boolean
 }

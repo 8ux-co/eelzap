@@ -132,8 +132,60 @@ export interface WebhookMediaEventData {
   media: Array<{ id: string; url: ZapLink; filename?: string }>
 }
 
-/** The kind of content a {@link WebhookChange} is about. */
-export type WebhookEventType = 'item' | 'document' | 'media'
+/**
+ * `data` of `zap.seo.updated`. Entry targets hang off their collection
+ * (`collection` set, `key` the slug); document targets off the site
+ * (`collection` null, `key` the document key). Never the SEO text.
+ */
+export interface WebhookSeoEventData {
+  site: WebhookSiteRef
+  collection: WebhookCollectionRef | null
+  targets: Array<{ kind: 'item' | 'document'; id: string; key: string; url: ZapLink }>
+}
+
+/** `data` of the `zap.collection.*` events. */
+export interface WebhookCollectionEventData {
+  site: WebhookSiteRef
+  collection: WebhookCollectionRef & { name?: string; url: ZapLink }
+  /** On `zap.collection.updated`: the names of what changed. */
+  changed?: string[]
+}
+
+/**
+ * `data` of `zap.schema.field_changed`: one entry per field or section
+ * change, on a collection (`collection_id`, `collection_key`) or a document
+ * (`document_id`, `document_key`). The keys are the owner's key when the event
+ * was emitted; payloads from before they were added carry the ids only.
+ */
+export interface WebhookSchemaEventData {
+  site: WebhookSiteRef
+  changes: Array<{
+    action: 'created' | 'updated' | 'deleted' | 'restored' | 'reordered'
+    kind: 'field' | 'section'
+    id: string | null
+    /** The field or section key. */
+    key?: string | null
+    collection_id: string | null
+    /** The collection's key. Absent on older payloads. */
+    collection_key?: string | null
+    document_id: string | null
+    /** The document's key. Absent on older payloads. */
+    document_key?: string | null
+  }>
+}
+
+/** `data` of the `zap.site.*` events (not the API-key ones). */
+export interface WebhookSiteEventData {
+  site: WebhookSiteRef & { name?: string }
+  /** On `zap.site.updated`: the names of the settings that changed. */
+  changed?: string[]
+}
+
+/**
+ * What a {@link WebhookChange} is about: an item, a document or a file, a
+ * whole collection (its settings or its fields), or the whole site.
+ */
+export type WebhookEventType = 'item' | 'document' | 'media' | 'collection' | 'site'
 
 /** What happened to it: the verb of the event name. */
 export type WebhookAction =
@@ -145,18 +197,32 @@ export type WebhookAction =
   | 'deleted'
   | 'rolled_back'
   | 'uploaded'
+  | 'field_changed'
 
 /**
- * One changed item, document or file, flattened out of a payload by
- * `webhookChanges` — the unit a site invalidates its cache by.
+ * One changed item, document, file, collection or site, flattened out of a
+ * payload by `webhookChanges`: the unit a site invalidates its cache by.
+ *
+ * - `item`: an entry; `resourceKey` is its slug, `collectionKey` its collection.
+ * - `document`: `resourceKey` is the document key. Also from
+ *   `zap.schema.field_changed` on a document's fields (action `field_changed`).
+ * - `media`: `resourceKey` is the file id.
+ * - `collection`: everything in one collection; `resourceKey` and
+ *   `collectionKey` are the collection key. From `zap.collection.*`, and from
+ *   `zap.schema.field_changed` on a collection's fields (action
+ *   `field_changed`). An older schema payload without the key names the
+ *   collection by id: `resourceKey` is its id and `collectionKey` is absent.
+ * - `site`: everything on the site; `id` and `resourceKey` are the site's id
+ *   and key. From `zap.site.updated`, and from an older
+ *   `zap.schema.field_changed` on a document's fields that has no document key.
  */
 export interface WebhookChange {
   type: WebhookEventType
   action: WebhookAction
   id: string
-  /** The item's slug, the document's key, or the file's id. */
+  /** The item's slug, the document's key, the file's id, the collection's key (its id on an older schema payload), or the site's key. */
   resourceKey: string
-  /** The item's collection. Items only. */
+  /** The item's collection, or the collection itself. Items and collections only. */
   collectionKey?: string
   siteKey: string
 }

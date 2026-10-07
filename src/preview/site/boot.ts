@@ -12,7 +12,7 @@ import {
 } from './config'
 import { loadChunk } from './load'
 import { DEFAULT_SHORTCUT, isShortcut } from './shortcut'
-import { readToken } from './token'
+import { readSession } from './token'
 
 /**
  * The core's part of Live suggestion mode (zap-cms-v2 §3.4, ADR 041), for a
@@ -25,7 +25,8 @@ import { readToken } from './token'
  *    `BroadcastChannel('eel-zap')` and the popup closes; after a full-page
  *    sign-in (the popup was blocked) the `signin` chunk finishes here. Either
  *    way the code leaves the address bar at once.
- * 2. **This tab holds a live token** for this site: the `suggest` chunk.
+ * 2. **This tab holds a live token** for this site (or a refresh token that
+ *    can renew it, `session.ts`): the `suggest` chunk.
  * 3. **The person asks**: `?zap` in the URL, or the shortcut (Shift Z by
  *    default, never while typing in a field or composing, `shortcut.ts`): the
  *    `signin` chunk, which shows the launcher.
@@ -48,6 +49,8 @@ export interface SiteModeOptions {
   chunkBase?: string | null
   /** Open at once: the boot already saw the trigger (the shortcut). */
   open?: boolean
+  /** The site's draft-mode route, for «Editar» on an untagged page (`draft-session.ts`). */
+  draftRoute?: string | null
 }
 
 /** The callback params when this page is one of ours, else null. */
@@ -91,6 +94,7 @@ export function startSiteMode(options: SiteModeOptions): () => void {
     redirectUri: `${win.location.origin}/`,
     locale: options.locale ?? pageLocale(doc),
     shortcut: key,
+    draftRoute: options.draftRoute ?? null,
     async open(name: ChunkName, startOptions?: StartOptions) {
       opening = true
       try {
@@ -129,10 +133,10 @@ export function startSiteMode(options: SiteModeOptions): () => void {
 
   const launch = () => {
     if (current || opening) return
-    void ctx.open(readToken(win, siteId) ? 'suggest' : 'signin', { reason: 'trigger' })
+    void ctx.open(readSession(win, siteId) ? 'suggest' : 'signin', { reason: 'trigger' })
   }
 
-  if (readToken(win, siteId)) void ctx.open('suggest')
+  if (readSession(win, siteId)) void ctx.open('suggest')
   else if (options.open || new URLSearchParams(win.location.search).has('zap')) launch()
 
   const onKey = (event: KeyboardEvent) => {

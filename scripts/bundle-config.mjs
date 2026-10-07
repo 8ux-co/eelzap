@@ -50,10 +50,37 @@ export const BUDGETS = {
    * values written to a link's href (`links`), *.localhost and https local
    * Zaps, one overlay per page. Measured: core 13096 → 13308, the release
    * build 13290 → 13498.
+   * Raised to 13888 for the runaway guard (`tagGuard`, `zap:paused`; owner,
+   * 2026-10-06), after the P0 editor crash. Measured 2026-10-06: core
+   * 13419 → 13643, the release build 13616 → 13839.
+   * Raised to 14208 for live «Editar» through a draft session (the draft route
+   * handed to the site tools) and the site client's refresh token (the core
+   * reads a session that can still renew; ADR 041 amendment 2026-10-06), with
+   * the overlay fixes of the same day. Measured 2026-10-06: core 13823, the
+   * release build about 14024.
+   * Raised to 14336 for fields of another record (`hello.foreign`, the chip's
+   * «en Configuración» suffix, board CampoOtroRegistro) and the clicked
+   * element's box on `zap:click`, plus the re-announced `zap:ready` (Back in
+   * Zap, the back-forward cache). Measured 2026-10-06: core 13907 → 14071,
+   * the release build 14105 → 14274.
+   * Raised to 14464 for the `[zap:fields]` trace behind
+   * `localStorage['eelzap:debug']` (each tags report with its cause, editor
+   * messages dropped), after the locate icons kept vanishing (item 31,
+   * 2026-10-06), and `zap:refresh` (the `refresh` capability, item 49).
+   * Measured: core 14071 → 14243, the release build 14274 → 14438.
+   * Raised to 14592 for the background draft-cookie renewal (a hello with a
+   * new preview token fetches the site's draft route; item 31, renewing
+   * ahead of the 10-minute session). Measured 2026-10-06: core 14255 → 14334,
+   * the release build 14447 → 14524.
    */
-  preview: 13568,
+  preview: 14592,
   signin: 8 * 1024,
-  suggest: 25 * 1024,
+  /**
+   * Raised from 25 KB to 27 KB (2026-10-06) for the draft-session exchange
+   * (`draft-session.ts`) and the token lifecycle (`session.ts`: silent
+   * renewal, retry on 401, the expired state). Measured 23909 → 26432.
+   */
+  suggest: 27 * 1024,
   /** Reserved, not built (§2.7 "Room for `./analytics`"). */
   analytics: 1024,
 }

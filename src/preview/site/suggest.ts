@@ -1,7 +1,7 @@
-import { buildAnchor } from '../anchor'
-import { Overlay, OVERLAY_HOST_TAG, type OverlayPin } from '../overlay'
+import { buildAnchor, normalizeText } from '../anchor'
+import { Overlay, OVERLAY_HOST_TAG, reveal as scrollTo, type OverlayPin } from '../overlay'
 import type { OverlayMode } from '../protocol'
-import { observeTags, TagIndex, type TaggedElement } from '../tags'
+import { observeTags, tagGuard, TagIndex, type PauseReason, type TaggedElement } from '../tags'
 import {
   createComment,
   fetchOnPage,
@@ -14,22 +14,34 @@ import {
   type OnPageComment,
 } from './api'
 import type { ChunkHandle, SiteContext, StartOptions } from './config'
+import { barDrag, DRAG_CSS } from './drag'
+import {
+  DRAFT_SESSION_MESSAGES,
+  inDraftSession,
+  leaveDraftSession,
+  requestDraftSession,
+  takeEditIntent,
+} from './draft-session'
 import { SUGGEST_MESSAGES } from './messages'
+import { isShortcut } from './shortcut'
 import {
   buildCreateBody,
   buildDraftBody,
   currentPageUrl,
+  editableText,
   editKindFor,
   fieldOf,
   parseProposed,
   pinsFor,
   recordFor,
+  sameValue,
   spotAnchor,
   toApiAnchor,
   type EditKind,
   type Proposal,
 } from './suggestion'
-import { clearToken, readToken } from './token'
+import { createTokenSession, SESSION_MESSAGES } from './session'
+import { clearToken, readSession } from './token'
 import { el, icon, initials, mountHost, TOKENS as T, type IconName } from './ui'
 
 /**
@@ -38,9 +50,23 @@ import { el, icon, initials, mountHost, TOKENS as T, type IconName } from './ui'
  * SitioEnviado, SitioRenovacion), loaded only once this tab holds a site
  * client token. The file keeps its old name so the CDN chunk keeps its own.
  *
- * - **Toolbar**: Navegar, Editar and Comentar, the page's open comments, the
- *   person's initials, Salir (which forgets the token). Navegar intercepts
- *   nothing and still shows the pins.
+ * - **Toolbar** (SitioBarraEstados): the grip, Navegar, Editar and Comentar,
+ *   the page's open comments, the account chip and the hide arrow. Navegar
+ *   intercepts nothing and still shows the pins.
+ * - **Account menu**: who you are, «Abrir en Zap» (the editor of the record
+ *   this page is, Zap's `viewer.editorUrl`, else Zap's home) and
+ *   «Cerrar sesión en Zap», which forgets the token as Salir did. A menu
+ *   button: arrows, Home and End move, Escape closes back to the chip, an
+ *   outside press or Tab closes it.
+ * - **Paused** (the runaway guard, `tags.ts` `tagGuard`): a page over the
+ *   tagged cap at boot, or whose tagged count keeps growing on its own, stops
+ *   being followed: no more scans or pins, Editar and Comentar off, and a
+ *   quiet «Vista previa pausada» card over the bar with «Recargar» (the
+ *   pill says it in its label).
+ * - **Hidden**: the hide arrow or Shift Z (the site's shortcut; never while
+ *   typing, editing or writing a comment) folds the bar into a pill with the
+ *   bolt and the open count, in the bar's place; a click or Shift Z brings it
+ *   back. Remembered per origin with the bar's place (`drag.ts`).
  * - **Editar** (only while the site's ADMIN leaves `liveEditing` on; off, the
  *   tool shows disabled with «Desactivado por un administrador»): the overlay
  *   outlines tagged fields; a click on a TEXT or LONG_TEXT field makes it
@@ -123,37 +149,56 @@ interface Editing {
 
 export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle {
   const { win, doc } = ctx
-  const stored = readToken(win, ctx.siteId)
+  const stored = readSession(win, ctx.siteId)
   if (!stored) {
     void ctx.open('signin', { reason: 'expired' })
     return { destroy() {} }
   }
-  const token = stored.token
+  // The token lifecycle (`session.ts`): every call gets a valid token, a 401
+  // renews once and retries, and the hour is renewed ahead of time.
+  const auth = createTokenSession(ctx, stored, { onExpired: () => expire() })
+  const sm = SESSION_MESSAGES[ctx.locale]
   const m = SUGGEST_MESSAGES[ctx.locale]
+  const dm = DRAFT_SESSION_MESSAGES[ctx.locale]
+  // Editar asked for a draft session on this page and the tab came back in
+  // draft mode: reopen Editar once the page read says it is allowed.
+  let reopenEdit = takeEditIntent(win)
 
-  const host = mountHost(doc, CSS)
+  const host = mountHost(doc, CSS + DRAG_CSS)
   const layer = el(doc, 'div', { class: 'layer' })
   const marks = el(doc, 'div', { class: 'marks' })
   const bottom = el(doc, 'div', { class: 'bottom' })
-  layer.append(marks, bottom)
+  // One tooltip for the bar's buttons, outside the toolbar: its horizontal scroll would clip it.
+  const tip = el(doc, 'div', { class: 'tip', attrs: { role: 'tooltip' } })
+  layer.append(marks, bottom, tip)
+  const drag = barDrag(win, doc, bottom, m.move, m.moveTip)
+  const key = ctx.shortcut ? ctx.shortcut.toUpperCase() : null
   host.root.append(layer)
 
   let mode: Mode = 'navigate'
   let selection: Element[] = []
   let data: OnPage | null = null
   let refused = false
+  /** The session ran out and could not be renewed: «Volver a entrar». */
+  let expired = false
   let composer: Composer | null = null
   let editing: Editing | null = null
   let list: OnPageComment[] | null = null
   let toast: { title: string; body: string; error?: boolean } | null = null
   let toastTimer: number | null = null
-  let status: 'saving' | 'saved' | null = null
+  let status: 'saving' | 'saved' | 'preparing' | null = null
   let statusTimer: number | null = null
   let frame: number | null = null
   let destroyed = false
   let pins: OverlayPin[] = []
   let numbers = new Map<string, number>()
   let lastClick = { x: 0, y: 0, additive: false }
+  let menuOpen = false
+  /** The `data-action` to focus after the next render. */
+  let focusNext: string | null = null
+  /** The next render shows the bar or the pill coming in (a toggle). */
+  let entering = false
+  let paused: PauseReason | null = null
 
   // Before the overlay installs its own capture listeners, so this one runs
   // first and still sees clicks the overlay consumes: where, and whether the
@@ -166,6 +211,17 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     }
   }
   win.addEventListener('click', onClickFirst, true)
+  // A press anywhere on the page closes the account menu. Presses inside the
+  // shadow root reach the window as the host; the layer sorts those out.
+  const onPressFirst = (event: PointerEvent) => {
+    if (menuOpen && event.target !== host.host) setMenu(false)
+  }
+  win.addEventListener('pointerdown', onPressFirst, true)
+  layer.addEventListener('pointerdown', (event) => {
+    if (!menuOpen) return
+    const keep = Array.from(bottom.querySelectorAll('.menu, [data-action="account"]'))
+    if (!keep.some((node) => node.contains(event.target as Node))) setMenu(false)
+  })
 
   const index = new TagIndex(doc)
   index.scan()
@@ -182,30 +238,58 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       const found = data?.comments.find((comment) => comment.id === id)
       if (!found) return
       list = [found]
-      renderBottom()
+      // A pin on the page while the bar is folded: the bar comes back with the thread.
+      if (drag.hidden()) setHidden(false, false)
+      else renderBottom()
     },
   })
   overlay.mount()
+  // Both hosts sit at the top z-index, so document order decides: the bar
+  // and its cards (this host) after the overlay's boxes, chips and pins.
+  doc.documentElement.appendChild(host.host)
 
-  const stopObserving = observeTags(
-    doc.documentElement,
-    () => {
-      index.scan()
-      placePins()
-    },
-    {
-      ignore: (node) => {
-        const own = overlay.hostElement
-        return node === host.host || (!!own && (node === own || own.contains(node)))
+  // The runaway guard: a page over the cap is never observed; one that keeps
+  // growing on its own stops being followed.
+  const check = tagGuard()
+  let stopObserving = () => {}
+  const atBoot = check(index.elements.length, true)
+  if (atBoot) {
+    // Before the bar's first render, which shows it; the tools start on Navegar.
+    paused = atBoot
+    console.warn(`eelzap: preview paused (${atBoot})`)
+  } else
+    stopObserving = observeTags(
+      doc.documentElement,
+      (page) => {
+        index.scan()
+        const reason = check(index.elements.length, page)
+        if (reason) pause(reason)
+        else placePins()
       },
-    },
-  )
+      {
+        ignore: (node) => {
+          const own = overlay.hostElement
+          return node === host.host || (!!own && (node === own || own.contains(node)))
+        },
+      },
+    )
+
+  function pause(reason: PauseReason): void {
+    if (paused) return
+    paused = reason
+    stopObserving()
+    console.warn(`eelzap: preview paused (${reason})`)
+    if (destroyed) return
+    // Pins would drift on a page no longer followed: take them down.
+    overlay.setPins([])
+    setMode('navigate')
+  }
 
   // ── Loading the page's context ──────────────────────────────────────────
 
   async function load(): Promise<void> {
     const refs = Array.from(new Set(index.elements.map((tagged) => tagged.recordRef)))
-    const result = await fetchOnPage(ctx, token, currentPageUrl(win), refs)
+    const result = await auth.call((token) => fetchOnPage(ctx, token, currentPageUrl(win), refs))
     if (destroyed) return
     if (!result.ok) {
       onFailure(result)
@@ -213,14 +297,24 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     }
     const first = data === null
     data = result.data
+    // Labels by key for the page's own records; by tag, with «en …», for
+    // fields of another record (a site-wide document in the header).
     const labels: Record<string, string> = {}
-    for (const fields of Object.values(data.fields ?? {})) {
+    const foreign: Record<string, [string, string]> = {}
+    for (const [ref, fields] of Object.entries(data.fields ?? {})) {
+      const name = data.records?.[ref]
       for (const [key, field] of Object.entries(fields)) {
-        if (typeof field?.label === 'string') labels[key] = field.label
+        if (typeof field?.label !== 'string') continue
+        if (name) foreign[`${ref}#${key}`] = [field.label, m.inRecord(name)]
+        else labels[key] = field.label
       }
     }
-    overlay.setLabels(labels)
+    overlay.setLabels(labels, foreign)
     if (!data.liveEditing && mode === 'edit') setMode('navigate')
+    if (reopenEdit) {
+      reopenEdit = false
+      if (canEdit()) setMode('edit')
+    }
     if (first && options.reason === 'renewed') {
       const name = data.viewer?.name
       setToast({ title: m.renewed, body: name ? m.renewedAs(name) : m.renewedBody })
@@ -257,7 +351,18 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
 
   function expire(): void {
     clearToken(win)
-    void ctx.open('signin', { reason: 'expired' })
+    if (expired || destroyed) return
+    // «Tu sesión de Zap expiró» with «Volver a entrar», not the refused card:
+    // the person has access, their hour (and its renewal) ran out.
+    expired = true
+    closeComposer()
+    overlay.setMode('off')
+    renderBottom()
+  }
+
+  /** «Volver a entrar»: the sign-in starts inside this click, so the popup is allowed. */
+  function signInAgain(): void {
+    void ctx.open('signin', { reason: 'expired', signIn: true })
   }
 
   // ── Toolbar, tray, list, status, toast ──────────────────────────────────
@@ -267,48 +372,284 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   }
 
   function setMode(next: Mode): void {
-    if (next === 'edit' && !canEdit()) return
+    if ((next === 'edit' && !canEdit()) || (paused && next !== 'navigate')) return
+    if (status === 'preparing') return
+    // A page rendered outside draft mode carries no tags (no stega, empty
+    // `attrs`): Editar first takes the tab through a draft session
+    // (`draft-session.ts`), unless this tab is already in one.
+    if (next === 'edit' && !index.elements.length && !inDraftSession(win)) {
+      void prepareEdit()
+      return
+    }
     endEdit()
     closeComposer()
     mode = next
     selection = []
     overlay.clearSelection()
     overlay.setMode(OVERLAY_MODE[next])
+    // In draft mode and still untagged: the page has no fields, so it says why.
+    if (next === 'edit' && !index.elements.length)
+      setToast({ title: m.noFields, body: m.noFieldsBody })
     renderBottom()
+  }
+
+  /**
+   * Editar on an untagged page: exchange the site-client token for a draft
+   * session and take the tab through the site's draft route; the page comes
+   * back tagged and Editar reopens. On failure, the «no fields» empty state
+   * with the reason.
+   */
+  async function prepareEdit(): Promise<void> {
+    setStatus('preparing')
+    const token = await auth.ensure()
+    if (token === null || destroyed) return
+    const result = await requestDraftSession(ctx, token)
+    if (destroyed) return
+    if (result.ok) {
+      // Stays «Preparando la edición…» until the page unloads.
+      win.location.assign(result.url)
+      return
+    }
+    setStatus(null)
+    if (result.reason === 'expired') {
+      expire()
+      return
+    }
+    const body =
+      result.reason === 'no-route'
+        ? dm.noRoute
+        : result.reason === 'rate'
+          ? dm.rate(result.retryAfter)
+          : dm.failed
+    setToast({ title: m.noFields, body, error: result.reason !== 'no-route' })
   }
 
   function renderBottom(): void {
     if (destroyed) return
+    hideTip()
+    // A render replaces the bar: keep focus on the same control.
+    const active = host.root.activeElement?.getAttribute('data-action')
+    const hidden = drag.hidden()
     const children: HTMLElement[] = []
     if (toast) children.push(toastCard(toast))
-    if (refused) {
-      children.push(refusedCard())
+    if (expired) {
+      children.push(expiredCard())
       bottom.replaceChildren(...children)
+      drag.place()
       marks.replaceChildren()
       return
     }
-    if (list) children.push(listCard(list))
-    if (selection.length > 0 && !composer) children.push(trayCard())
+    if (refused) {
+      children.push(refusedCard())
+      bottom.replaceChildren(...children)
+      drag.place()
+      marks.replaceChildren()
+      return
+    }
+    if (paused && !hidden) children.push(pausedCard(paused))
+    if (list && !hidden) children.push(listCard(list))
+    if (selection.length > 0 && !composer && !hidden) children.push(trayCard())
     if (status) {
       children.push(
         el(doc, 'div', { class: 'card status', attrs: { role: 'status' } }, [
           status === 'saved' ? icon(doc, 'check', 14) : null,
-          status === 'saved' ? m.saved : m.saving,
+          status === 'saved' ? m.saved : status === 'preparing' ? dm.preparing : m.saving,
         ]),
       )
     }
-    children.push(toolbar())
+    if (menuOpen && !hidden) children.push(menuCard())
+    const bar = hidden ? pill() : toolbar()
+    if (entering) bar.setAttribute('data-enter', '')
+    entering = false
+    children.push(bar)
     bottom.replaceChildren(...children)
+    drag.place()
     drawMarks()
+    const want = focusNext ?? active
+    focusNext = null
+    if (want)
+      bottom.querySelector<HTMLElement>(`[data-action="${want}"]`)?.focus({ preventScroll: true })
+  }
+
+  function openCount(): [number, string] {
+    const open = data?.comments.length ?? 0
+    return [open, data?.truncated ? `${open}+` : String(open)]
+  }
+
+  function setMenu(open: boolean, focus: string | null = null): void {
+    if (menuOpen === open && !focus) return
+    menuOpen = open
+    focusNext = focus
+    renderBottom()
+  }
+
+  /** Bar to pill and back. `fromUi`: focus follows to the other control. */
+  function setHidden(value: boolean, fromUi: boolean): void {
+    if (refused || drag.hidden() === value) return
+    if (value) {
+      endEdit()
+      closeComposer()
+      selection = []
+      overlay.clearSelection()
+      list = null
+      menuOpen = false
+    }
+    drag.setHidden(value)
+    overlay.setMode(value ? 'off' : OVERLAY_MODE[mode])
+    focusNext = fromUi ? (value ? 'show' : 'hide') : null
+    entering = true
+    renderBottom()
+  }
+
+  /** The bar's tooltip (SitioBarraEstados) with the shortcut's key chip, on hover and keyboard focus. */
+  function withTip(target: HTMLElement, text: string, end: boolean): HTMLElement {
+    const show = () => {
+      tip.replaceChildren(text)
+      if (key) tip.append(el(doc, 'span', { class: 'kbd', text: `Shift ${key}` }))
+      tip.classList.add('on')
+      const rect = target.getBoundingClientRect()
+      const vw = doc.documentElement.clientWidth || win.innerWidth
+      const w = tip.offsetWidth
+      // Over the bar: 8px off its edge (the hide arrow sits 7px inside it), under it when the bar opens down.
+      const gap = end ? 15 : 8
+      const x = end ? rect.right + 7 - w : rect.left + (rect.width - w) / 2
+      tip.style.left = `${Math.min(Math.max(x, 8), vw - w - 8)}px`
+      tip.style.top = bottom.hasAttribute('data-below')
+        ? `${rect.bottom + gap}px`
+        : `${rect.top - gap - tip.offsetHeight}px`
+    }
+    const focus = () => {
+      try {
+        if (target.matches(':focus-visible')) show()
+      } catch {
+        show()
+      }
+    }
+    for (const [type, handler] of [
+      ['mouseenter', show],
+      ['focus', focus],
+      ['mouseleave', hideTip],
+      ['blur', hideTip],
+      ['pointerdown', hideTip],
+    ] as const) {
+      target.addEventListener(type, handler)
+    }
+    if (key) target.setAttribute('aria-keyshortcuts', `Shift+${key}`)
+    return target
+  }
+
+  function hideTip(): void {
+    tip.classList.remove('on')
+  }
+
+  function avatar(name: string | null, large = false): HTMLElement {
+    return el(doc, 'span', {
+      class: large ? 'avatar lg' : 'avatar',
+      attrs: { 'aria-hidden': 'true' },
+      text: initials(name),
+    })
+  }
+
+  function menuCard(): HTMLElement {
+    const name = data?.viewer?.name ?? null
+    const email = data?.viewer?.email ?? null
+    const item = (action: string, label: string, glyph: IconName, run: () => void) =>
+      el(
+        doc,
+        'button',
+        {
+          class: 'mi',
+          attrs: { type: 'button', role: 'menuitem', tabindex: '-1', 'data-action': action },
+          on: {
+            click: run,
+            pointerenter: (event) => (event.currentTarget as HTMLElement).focus(),
+          },
+        },
+        [icon(doc, glyph), label],
+      )
+    return el(
+      doc,
+      'div',
+      {
+        class: 'card menu',
+        attrs: { role: 'menu', 'aria-label': m.accountMenu, tabindex: '-1', 'data-action': 'menu' },
+        on: { keydown: onMenuKey },
+      },
+      [
+        el(doc, 'div', { class: 'menu-head' }, [
+          avatar(name, true),
+          el(doc, 'div', { class: 'menu-who' }, [
+            el(doc, 'span', { class: 'menu-name', text: name ?? m.someone }),
+            email ? el(doc, 'span', { class: 'menu-mail', text: email }) : null,
+          ]),
+        ]),
+        el(doc, 'div', { class: 'sep', attrs: { role: 'separator' } }),
+        item('open-zap', m.openInZap, 'external', () => {
+          setMenu(false, 'account')
+          win.open(zapUrl(data?.viewer?.editorUrl, ctx.zapOrigin), '_blank', 'noopener')
+        }),
+        el(doc, 'div', { class: 'sep', attrs: { role: 'separator' } }),
+        item('sign-out', m.signOut, 'exit', exit),
+      ],
+    )
+  }
+
+  function onMenuKey(event: Event): void {
+    const e = event as KeyboardEvent
+    if (e.key === 'Tab') {
+      // Close, and let Tab move on from the chip.
+      setMenu(false, 'account')
+      return
+    }
+    const items = Array.from(bottom.querySelectorAll<HTMLElement>('.menu [role="menuitem"]'))
+    const at = items.indexOf(host.root.activeElement as HTMLElement)
+    const to = (
+      { ArrowDown: at + 1, ArrowUp: at < 0 ? -1 : at - 1, Home: 0, End: -1 } as Record<
+        string,
+        number
+      >
+    )[e.key]
+    if (to === undefined) return
+    e.preventDefault()
+    items[(to + items.length) % items.length]?.focus()
+  }
+
+  function pill(): HTMLElement {
+    const [open, shown] = openCount()
+    // The pill drags like the grip (`drag.ts`); a press that did not move is the click.
+    return withTip(
+      drag.grab(
+        el(
+          doc,
+          'button',
+          {
+            class: 'card pill',
+            attrs: {
+              type: 'button',
+              'aria-label':
+                m.showBar(open).replace(String(open), shown) + (paused ? `. ${m.paused}` : ''),
+              'data-action': 'show',
+            },
+            on: { click: () => setHidden(false, true) },
+          },
+          [
+            icon(doc, 'zap', 20),
+            el(doc, 'span', { class: 'pill-count' }, [icon(doc, 'thread', 14), shown]),
+          ],
+        ),
+      ),
+      m.show,
+      false,
+    )
   }
 
   function toolbar(): HTMLElement {
-    const open = data?.comments.length ?? 0
+    const [open, shown] = openCount()
     const name = data?.viewer?.name ?? null
     const tool = (value: Mode, label: string, glyph: IconName) => {
-      const off = value === 'edit' && !canEdit()
+      const off = (value === 'edit' && !canEdit()) || (!!paused && value !== 'navigate')
       // Disabled by the ADMIN: says so; still loading: just not yet.
-      const why = off && data ? m.editOff : null
+      const why = paused && off ? m.paused : off && data ? m.editOff : null
       return el(
         doc,
         'button',
@@ -332,6 +673,8 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       'div',
       { class: 'card toolbar', attrs: { role: 'toolbar', 'aria-label': m.toolbar } },
       [
+        drag.handle,
+        el(doc, 'span', { class: 'divider', attrs: { 'aria-hidden': 'true' } }),
         icon(doc, 'zap', 20),
         el(doc, 'div', { class: 'segments', attrs: { role: 'group', 'aria-label': m.tools } }, [
           tool('navigate', m.navigate, 'pointer'),
@@ -352,20 +695,51 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
               },
             },
           },
-          [
-            icon(doc, 'thread'),
-            data?.truncated ? m.open(open).replace(String(open), `${open}+`) : m.open(open),
-          ],
+          [icon(doc, 'thread'), m.open(open).replace(String(open), shown)],
         ),
         el(doc, 'span', { class: 'divider', attrs: { 'aria-hidden': 'true' } }),
-        name
-          ? el(doc, 'span', { class: 'avatar', attrs: { title: name }, text: initials(name) })
-          : null,
         el(
           doc,
           'button',
-          { class: 'tool', attrs: { type: 'button', 'data-action': 'exit' }, on: { click: exit } },
-          [icon(doc, 'exit'), m.exit],
+          {
+            class: 'tool account',
+            attrs: {
+              type: 'button',
+              'aria-haspopup': 'menu',
+              'aria-expanded': String(menuOpen),
+              'aria-label': name ? m.account(name) : m.accountMenu,
+              'data-action': 'account',
+            },
+            on: {
+              // A pointer opens onto the menu itself; Enter or Space onto its first item.
+              click: (event) =>
+                setMenu(
+                  !menuOpen,
+                  menuOpen ? 'account' : (event as MouseEvent).detail ? 'menu' : 'open-zap',
+                ),
+              keydown: (event) => {
+                const k = (event as KeyboardEvent).key
+                if (k !== 'ArrowDown' && k !== 'ArrowUp') return
+                event.preventDefault()
+                setMenu(true, k === 'ArrowUp' ? 'sign-out' : 'open-zap')
+              },
+            },
+          },
+          [avatar(name), icon(doc, 'chevron', 13)],
+        ),
+        withTip(
+          el(
+            doc,
+            'button',
+            {
+              class: 'tool hide',
+              attrs: { type: 'button', 'aria-label': m.hide, 'data-action': 'hide' },
+              on: { click: () => setHidden(true, true) },
+            },
+            [icon(doc, 'eyeOff', 16)],
+          ),
+          m.hide,
+          true,
         ),
       ],
     )
@@ -453,7 +827,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   /** Scroll to a thread's pin. */
   function reveal(id: string): void {
     const pin = pins.find((entry) => entry.id === id)
-    if (pin?.element) pin.element.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
+    if (pin?.element) scrollTo(win, pin.element)
     else if (pin?.spot) {
       const root = doc.documentElement
       win.scrollTo?.({
@@ -480,6 +854,47 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
         closeButton(m.dismiss, () => setToast(null)),
       ],
     )
+  }
+
+  /** The guard's pause (the editor banner's words), quiet: the refused card's layout, a muted icon. */
+  function pausedCard(reason: PauseReason): HTMLElement {
+    return el(doc, 'div', { class: 'card refused paused', attrs: { role: 'status' } }, [
+      icon(doc, 'alert', 18),
+      el(doc, 'div', { class: 'toast-text' }, [
+        el(doc, 'span', { class: 'title', text: m.paused }),
+        el(doc, 'span', {
+          class: 'muted',
+          text: reason === 'cap' ? m.pausedCap : m.pausedRunaway,
+        }),
+      ]),
+      el(doc, 'button', {
+        class: 'tool',
+        text: m.reload,
+        attrs: { type: 'button', 'data-action': 'reload' },
+        on: { click: () => win.location.reload() },
+      }),
+    ])
+  }
+
+  /** The session ran out (item 32): not a refusal, so the way back is one click. */
+  function expiredCard(): HTMLElement {
+    return el(doc, 'div', { class: 'card refused', attrs: { role: 'alert' } }, [
+      icon(doc, 'alert', 18),
+      el(doc, 'div', { class: 'toast-text' }, [
+        el(doc, 'span', { class: 'title', text: sm.expiredTitle }),
+        el(doc, 'span', { class: 'muted', text: sm.expiredBody }),
+      ]),
+      el(
+        doc,
+        'button',
+        {
+          class: 'tool',
+          attrs: { type: 'button', 'data-action': 'sign-in-again' },
+          on: { click: signInAgain },
+        },
+        [icon(doc, 'eel'), sm.signInAgain],
+      ),
+    ])
   }
 
   function refusedCard(): HTMLElement {
@@ -526,6 +941,9 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   }
 
   function exit(): void {
+    // Drop this tab's draft session too (revoked at Zap, the cookie through
+    // the site's exit route, then a published reload) when it has one.
+    void leaveDraftSession(ctx, auth.token(), index.elements.length > 0)
     clearToken(win)
     ctx.close()
   }
@@ -533,7 +951,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   // ── Pins and marks ──────────────────────────────────────────────────────
 
   function placePins(): void {
-    if (destroyed || refused || !data) return
+    if (destroyed || refused || paused || !data) return
     const placed = pinsFor(data.comments ?? [], index, doc, win)
     pins = placed.pins
     numbers = placed.numbers
@@ -643,7 +1061,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const before =
       field?.type === 'URL' && target?.localName === 'a'
         ? (target.getAttribute('href') ?? '')
-        : (target?.textContent ?? '').replace(/\s+/g, ' ').trim()
+        : normalizeText(target?.textContent ?? '')
     const spotPin = point ? anchors[0] : null
 
     const textarea = el(doc, 'textarea', {
@@ -847,7 +1265,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const parsed = parseProposed(session.field.type, session.proposal.value)
     if (!parsed.ok) return 'invalid'
     const before = parseProposed(session.field.type, session.before)
-    if (before.ok && before.value === parsed.value) return null
+    if (before.ok && sameValue(before.value, parsed.value)) return null
     return { fieldKey: session.tagged.fieldKey, locale: session.tagged.locale, value: parsed.value }
   }
 
@@ -896,7 +1314,8 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     session.busy = true
     delete session.error.dataset.sticky
     refreshSend()
-    const result = await createComment(ctx, token, body, session.idempotency.key)
+    const key = session.idempotency.key
+    const result = await auth.call((token) => createComment(ctx, token, body, key))
     if (destroyed || composer !== session) return
     session.busy = false
     if (!result.ok) {
@@ -953,7 +1372,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const before =
       field.type === 'URL' && element.localName === 'a'
         ? (element.getAttribute('href') ?? '')
-        : (element.textContent ?? '').replace(/\s+/g, ' ').trim()
+        : normalizeText(element.textContent ?? '')
     const inline = kind === 'text' ? beginInlineEdit(element) : null
     const session: Editing = {
       element,
@@ -1060,8 +1479,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
 
   function typedValue(session: Editing): string {
     if (session.input) return session.input.value
-    const element = session.element
-    return element.innerText ?? element.textContent ?? ''
+    return editableText(session.element)
   }
 
   function finishEdit(session: Editing, keepTyped: boolean): void {
@@ -1087,8 +1505,10 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       setToast({ title: m.saveFailed, body: m.invalidNumber, error: true })
       return
     }
+    // Nothing changed (stega markers and whitespace aside): put the element
+    // back and write nothing, no thread and no draft.
     const before = parseProposed(session.field.type, session.before)
-    if (before.ok && before.value === parsed.value) {
+    if (before.ok && sameValue(before.value, parsed.value)) {
       finishEdit(session, false)
       return
     }
@@ -1108,7 +1528,10 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       anchors: session.anchors,
       proposal,
     })
-    const result = await saveToDraft(ctx, token, body, newIdempotencyKey(win))
+    // One key for the retry after a renewal too: a 401 wrote nothing, and the
+    // same key keeps a doubled answer from saving twice.
+    const draftKey = newIdempotencyKey(win)
+    const result = await auth.call((token) => saveToDraft(ctx, token, body, draftKey))
     if (destroyed) return
     if (!result.ok) {
       // The page goes back to what is published; nothing was saved.
@@ -1127,6 +1550,17 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   // ── Page events ─────────────────────────────────────────────────────────
 
   const onKey = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') hideTip()
+    if (menuOpen && event.key === 'Escape') {
+      event.preventDefault()
+      setMenu(false, 'account')
+      return
+    }
+    // Shift Z: bar to pill and back, never while editing a field or writing a comment.
+    if (ctx.shortcut && !editing && !composer && isShortcut(event, ctx.shortcut)) {
+      setHidden(!drag.hidden(), !!host.root.activeElement)
+      return
+    }
     if (composer && event.key === 'Escape') {
       event.preventDefault()
       closeComposer()
@@ -1148,23 +1582,31 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       commitEdit(session)
     }
   }
+  /** Links and forms work in Navegar (or with the bar folded) only. */
+  const blocks = () => mode !== 'navigate' && !drag.hidden()
   const onClick = (event: MouseEvent) => {
     // The element being edited may be (or sit in) a link: place the caret, never navigate.
+    // The overlay consumes link clicks while it is on; this covers the
+    // moments it is off in Editar or Comentar (the composer is open).
     if (
-      editing?.kind === 'text' &&
-      !editing.done &&
-      editing.element.contains(event.target as Node)
+      (editing?.kind === 'text' &&
+        !editing.done &&
+        editing.element.contains(event.target as Node)) ||
+      (blocks() && (event.target as Element).closest?.('a[href],area[href]'))
     ) {
       event.preventDefault()
     }
   }
+  const onSubmit = (event: Event) => {
+    if (blocks()) event.preventDefault()
+  }
   win.addEventListener('keydown', onKey, true)
   win.addEventListener('click', onClick, true)
+  win.addEventListener('submit', onSubmit, true)
   win.addEventListener('scroll', schedule, true)
   win.addEventListener('resize', schedule)
-  const expiry = win.setTimeout(expire, Math.max(0, stored.exp - Date.now() - 30_000))
 
-  overlay.setMode(OVERLAY_MODE[mode])
+  overlay.setMode(drag.hidden() ? 'off' : OVERLAY_MODE[mode])
   renderBottom()
   void load()
 
@@ -1173,19 +1615,37 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       endEdit()
       destroyed = true
       closeComposer()
-      win.clearTimeout(expiry)
+      auth.destroy()
       if (toastTimer !== null) win.clearTimeout(toastTimer)
       if (statusTimer !== null) win.clearTimeout(statusTimer)
       win.removeEventListener('click', onClickFirst, true)
+      win.removeEventListener('pointerdown', onPressFirst, true)
       win.removeEventListener('keydown', onKey, true)
       win.removeEventListener('click', onClick, true)
+      win.removeEventListener('submit', onSubmit, true)
       win.removeEventListener('scroll', schedule, true)
       win.removeEventListener('resize', schedule)
       stopObserving()
       overlay.destroy()
+      drag.destroy()
       host.destroy()
     },
   }
+}
+
+/**
+ * «Abrir en Zap»: the record's editor URL when Zap sent one (http or https
+ * only, never another scheme), else Zap's home.
+ */
+export function zapUrl(editorUrl: string | null | undefined, zapOrigin: string): string {
+  const home = new URL('/', zapOrigin)
+  try {
+    const url = new URL(editorUrl ?? '')
+    if (url.protocol === 'https:' || url.protocol === 'http:') return url.href
+  } catch {
+    // No URL, or not one: Zap's home.
+  }
+  return home.href
 }
 
 /** Exported for specs: the overlay's own host tag, which the site tools never draw over. */
@@ -1197,17 +1657,52 @@ const CSS = `
 .bottom { position: fixed; left: 0; right: 0; bottom: 22px; display: flex; flex-direction: column;
   align-items: center; gap: 10px; pointer-events: none; padding: 0 8px; }
 .bottom > .card { position: relative; }
-.toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 12px; white-space: nowrap;
+.toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 4px; white-space: nowrap;
   max-width: 100%; overflow-x: auto; }
-.segments { display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px; background: ${T.subtle}; }
-.seg { position: relative; height: 26px; padding: 0 9px; border-radius: 5px; font-size: 12px; color: ${T.muted}; }
+.segments { display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px; background: ${T.subtle};
+  background: oklch(0.94 0.008 250); }
+.seg { position: relative; height: 28px; padding: 0 10px; border-radius: 5px; font-size: 12px; color: ${T.muted}; }
 .seg[aria-pressed="true"] { background: ${T.bg}; color: ${T.fg}; box-shadow: 0 1px 2px rgba(15,23,42,.05); }
 .seg[aria-disabled="true"] { opacity: .5; cursor: default; }
 .seg[data-tip]:hover::after { content: attr(data-tip); position: absolute; bottom: 34px; left: 50%;
   transform: translateX(-50%); padding: 6px 10px; border-radius: 9px; background: ${T.dark}; color: #FFFFFF;
   font-size: 12px; white-space: nowrap; }
 .tool { height: 30px; padding: 0 9px; border-radius: 9px; color: ${T.muted}; }
-.tool:hover, .seg:not([aria-disabled="true"]):hover { background: ${T.subtle}; }
+/* Hover as the suite's SegmentedControl and ghost button (SitioBarraEstados): a tool on the track
+   gets foreground text over white at 60%, no shadow; the bar's own buttons, on the white card, the
+   ghost hover: foreground text over slate-100. Both keep the focus ring. */
+.seg:not([aria-pressed="true"]):not([aria-disabled="true"]):hover { background: rgba(255,255,255,.6); color: ${T.fg}; }
+.tool:hover, .grip:hover, .account[aria-expanded="true"] { background: #F1F5F9; color: ${T.fg}; }
+.seg, .tool, .grip, .pill { transition: color .15s cubic-bezier(.4,0,.2,1), background-color .15s cubic-bezier(.4,0,.2,1); }
+.seg:focus-visible, .tool:focus-visible, .grip:focus-visible { box-shadow: 0 0 0 3px ${T.focus}; }
+/* The account chip and the hide arrow (SitioBarraEstados): ghost buttons, chevrons muted until hover. */
+.account { padding: 0 4px 0 2px; gap: 3px; }
+.hide { width: 30px; padding: 0; justify-content: center; }
+.avatar.lg { width: 32px; height: 32px; }
+.menu { width: 260px; padding: 4px; border-radius: 11px; outline: none;
+  box-shadow: 0 10px 15px -3px rgba(15,23,42,.1), 0 4px 6px -4px rgba(15,23,42,.08); }
+.menu-head { display: flex; align-items: center; gap: 10px; padding: 8px 8px 10px; }
+.menu-who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.menu-name { font-weight: 500; }
+.menu-mail { font-size: 12px; color: ${T.muted}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sep { height: 1px; background: ${T.border}; margin: 4px -4px; }
+.menu-head + .sep { margin-top: 0; }
+.mi { width: 100%; height: 32px; gap: 9px; padding: 0 8px; border-radius: 7px; font-weight: 400; color: ${T.fg}; }
+.mi > .icon { color: ${T.muted}; }
+.mi:focus, .mi:focus-visible { outline: none; background: #F1F5F9; box-shadow: none; }
+.pill { height: 44px; gap: 8px; padding: 0 12px 0 11px; border-radius: 999px; }
+.pill:hover { background: #F8FAFC; }
+.pill:focus-visible { box-shadow: 0 0 0 3px ${T.focus}, 0 20px 25px -5px rgba(15,23,42,.12); }
+.pill-count { display: inline-flex; align-items: center; gap: 4px; }
+.tip { position: fixed; display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 9px;
+  border-radius: 7px; background: #101828; color: #FFFFFF; font-weight: 500; font-size: 12px; line-height: 18px;
+  white-space: nowrap; pointer-events: none; }
+.tip:not(.on) { display: none; }
+.kbd { font-size: 11px; line-height: 16px; color: #CBD5E1; padding: 1px 5px; border-radius: 4px;
+  background: rgba(255,255,255,.12); }
+[data-enter] { animation: eelzap-in .16s cubic-bezier(.4,0,.2,1); }
+@keyframes eelzap-in { from { opacity: 0; transform: scale(.96); } }
+@media (prefers-reduced-motion: reduce) { .seg, .tool, .grip, .pill { transition: none; } [data-enter] { animation: none; } }
 .tool.strong { color: ${T.fg}; }
 .divider { width: 1px; height: 22px; background: ${T.border}; }
 .avatar { width: 26px; height: 26px; border-radius: 7px; background: #DBEAFE; color: #1D4ED8;
@@ -1231,6 +1726,7 @@ const CSS = `
 .refused { align-self: center; margin-right: 0; width: min(420px, calc(100vw - 16px)); align-items: flex-start; }
 .toast > .icon { color: #16A34A; }
 .refused > .icon, .toast-error > .icon { color: ${T.danger}; }
+.paused > .icon { color: ${T.muted}; }
 .toast-text { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .title { font-weight: 600; }
 .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

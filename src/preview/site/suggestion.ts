@@ -1,3 +1,4 @@
+import { cleanStega } from '../../stega'
 import { findAnchorElement, normalizeText } from '../anchor'
 import type { OverlayPin } from '../overlay'
 import { isRecordRef, parseRecordRef, type DomAnchor, type PageAnchor } from '../protocol'
@@ -182,11 +183,52 @@ function proposedPart(proposal: Proposal): Pick<CreateBody, 'locale' | 'proposed
   }
 }
 
+/**
+ * Two parsed values are the same edit: numbers by value, text without stega
+ * markers and with whitespace collapsed (`normalizeText`), so a field left
+ * as it was, read back from a preview page, never counts as a change.
+ */
+export function sameValue(a: string | number, b: string | number): boolean {
+  if (typeof a === 'number' || typeof b === 'number') return a === b
+  return normalizeText(a) === normalizeText(b)
+}
+
+const LINE_BLOCKS = new Set(['div', 'p', 'li'])
+
+/**
+ * The text an inline edit left in `element`, as typed: its text nodes, `<br>`
+ * and a new block (what Enter makes in a contenteditable) as line breaks.
+ * Never `innerText`: it applies CSS, so a field shown with `text-transform:
+ * uppercase` read back in capitals and every edit of it looked like a change.
+ */
+export function editableText(element: Element): string {
+  let out = ''
+  const walk = (node: Node) => {
+    for (let child = node.firstChild; child; child = child.nextSibling) {
+      if (child.nodeType === 3) {
+        out += (child as Text).data
+      } else if (child.nodeType === 1) {
+        const name = (child as Element).localName
+        if (name === 'br') {
+          out += '\n'
+          continue
+        }
+        if (LINE_BLOCKS.has(name) && out !== '' && !out.endsWith('\n')) out += '\n'
+        walk(child)
+      }
+    }
+  }
+  walk(element)
+  return out
+}
+
 /** The value typed for `kind`, parsed for its field type; `invalid` when a number is not one. */
 export function parseProposed(
   type: string,
   raw: string,
 ): { ok: true; value: string | number } | { ok: false } {
+  // Text read from the page in preview carries stega markers; never send one.
+  raw = cleanStega(raw)
   if (type === 'NUMBER') {
     const text = raw.trim().replace(',', '.')
     const value = Number(text)

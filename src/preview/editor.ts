@@ -98,6 +98,8 @@ export interface EditorBridgeHandlers {
   onSpot?(payload: PageMessages['zap:spot']): void
   /** A drawn pin was clicked (`pins` capability). */
   onPin?(payload: PageMessages['zap:pin']): void
+  /** The page's runaway guard stopped following the page; it writes no more values. */
+  onPaused?(payload: PageMessages['zap:paused']): void
   onDrop?(reason: DropReason): void
 }
 
@@ -142,6 +144,8 @@ export interface EditorBridge {
   focusField(recordRef: RecordRef, fieldKey: string): void
   setMode(mode: OverlayMode): void
   setZoom(zoom: number): void
+  /** Reload the page in place; only for a page whose `zap:ready` advertised `refresh`. */
+  refresh(): void
   highlight(anchors: DomAnchor[]): void
   /**
    * The numbered pins to draw (≤ 50), only for a page whose `zap:ready`
@@ -327,6 +331,8 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
         return handlers.onSpot?.(message.payload)
       case 'zap:pin':
         return handlers.onPin?.(message.payload)
+      case 'zap:paused':
+        return handlers.onPaused?.(message.payload)
       case 'zap:error':
         if (message.payload.code === PAGE_UNLOAD_ERROR) {
           // Hold everything for the next document's ready.
@@ -414,6 +420,9 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
       currentZoom = zoom
       send({ type: 'zap:zoom', payload: { zoom } })
     },
+    refresh() {
+      send({ type: 'zap:refresh', payload: {} })
+    },
     highlight(anchors) {
       send({ type: 'zap:highlight', payload: { anchors } })
     },
@@ -442,6 +451,7 @@ export {
   PAGE_UNLOAD_ERROR,
   parsePageMessage,
   type Capability,
+  type ClickPayload,
   type DomAnchor,
   type DropReason,
   type HelloPayload,
@@ -449,6 +459,7 @@ export {
   type PageAnchor,
   type PageMessage,
   type PageMessages,
+  type PausedPayload,
   type Pin,
   type PreviewValue,
   type RecordRef,

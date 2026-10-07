@@ -220,6 +220,8 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     }
   } else {
     render()
+    // «Volver a entrar»: one click already made, so the sign-in starts now.
+    if (options.signIn) void signIn()
   }
 
   return {

@@ -3,6 +3,7 @@ import {
   isLocale,
   parseRecordRef,
   parseTag,
+  type PausedPayload,
   type RecordRef,
   type TagSource,
   type TagSummary,
@@ -235,6 +236,38 @@ export class TagIndex {
   }
 }
 
+/** Tagged elements past which the preview stops following the page. */
+export const MAX_TAGGED = 5000
+/** Passes in a row the tagged count may grow with nothing on the page explaining it. */
+export const RUNAWAY_PASSES = 3
+
+/** Why the guard stopped following the page (`zap:paused`). */
+export type PauseReason = PausedPayload['reason']
+
+/**
+ * The runaway guard (defence in depth for the 2026-10 crash, where values
+ * carrying stega markers made every pass add markers, and the tagged count
+ * doubled until the tab ran out of memory). Call the returned check once per
+ * pass, right after `scan()`, with the tagged count and `observeTags`'s
+ * `page` flag. It answers why to stop following the page, or null:
+ *
+ * - `cap`: more than `MAX_TAGGED` tagged elements;
+ * - `runaway`: the count grew on `RUNAWAY_PASSES` passes in a row that no
+ *   page mutation explains (a values patch's own writes are made outside a
+ *   pass, so they count as the page's).
+ *
+ * Once it answers, the caller stops observing and stops writing.
+ */
+export function tagGuard(): (count: number, page: boolean) => PauseReason | null {
+  let last = 0
+  let grew = 0
+  return (count, page) => {
+    grew = count > last && !page ? grew + 1 : 0
+    last = count
+    return count > MAX_TAGGED ? 'cap' : grew >= RUNAWAY_PASSES ? 'runaway' : null
+  }
+}
+
 export interface ObserveOptions {
   /** Minimum gap between two callbacks. Default 250 ms. */
   throttleMs?: number
@@ -250,10 +283,15 @@ export interface ObserveOptions {
  * thousands of records a second, and the index needs one rescan per burst.
  * Mutations made by the overlay's own host are ignored, so drawing outlines
  * never triggers a rescan.
+ *
+ * `page` says whether the page changed since the last call. Mutations made
+ * DURING `onChange` (our own writes: `reapply()`) still lead to one more
+ * call, so they settle as before, but with `page` false: the runaway guard
+ * (`tagGuard`) tells a site that keeps rendering from a pass feeding itself.
  */
 export function observeTags(
   target: Node,
-  onChange: () => void,
+  onChange: (page: boolean) => void,
   options: ObserveOptions = {},
 ): () => void {
   const throttleMs = options.throttleMs ?? 250
@@ -265,17 +303,25 @@ export function observeTags(
 
   let timer: unknown = null
   let last = -Infinity
-  const fire = () => {
-    timer = null
-    last = Date.now()
-    onChange()
-  }
-  const observer = new Observer((records) => {
+  let page = false
+  const queue = (records: MutationRecord[], fromPage: boolean) => {
     if (options.ignore && records.every((record) => options.ignore!(record.target))) return
+    page ||= fromPage
     if (timer !== null) return
     const wait = Math.max(0, last + throttleMs - Date.now())
     timer = set(fire, Math.max(wait, 16))
-  })
+  }
+  const fire = () => {
+    timer = null
+    last = Date.now()
+    const changed = page
+    page = false
+    onChange(changed)
+    // What onChange wrote is ours, not the page's.
+    const own = observer.takeRecords()
+    if (own.length) queue(own, false)
+  }
+  const observer = new Observer((records) => queue(records, true))
   observer.observe(target, {
     subtree: true,
     childList: true,

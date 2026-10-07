@@ -4,6 +4,7 @@ import {
   envelope,
   isDraftRoutePath,
   isPreviewValue,
+  MAX_LABELS,
   MAX_MESSAGE_BYTES,
   parseEditorMessage,
   parsePageMessage,
@@ -412,6 +413,100 @@ describe('comment pins and spots', () => {
       ).ok
     expect(ready(['overlay', 'values', 'stega', 'pins'])).toBe(true)
     expect(ready(['overlay', 'values', 'stega', 'pins', 'links'])).toBe(true)
+    expect(ready(['overlay', 'values', 'stega', 'pins', 'links', 'refresh'])).toBe(true)
     expect(ready(['overlay', 'comments'])).toBe(false)
+  })
+})
+
+describe('foreign labels in the hello', () => {
+  const FOREIGN = { 'doc:configuracion#boletin_titulo': ['Título', 'en Configuración'] }
+  const parse = (foreign: unknown) =>
+    parseEditorMessage(envelope('zap:hello', SESSION, { ...hello, foreign })).ok
+
+  it('accepts a hello with foreign labels, and one without', () => {
+    expect(parse(FOREIGN)).toBe(true)
+    expect(parseEditorMessage(envelope('zap:hello', SESSION, hello)).ok).toBe(true)
+    expect(parse({})).toBe(true)
+  })
+
+  it('accepts the limits exactly', () => {
+    const many = Object.fromEntries(
+      Array.from({ length: MAX_LABELS }, (_, i) => [
+        `blog/x#f${i}`,
+        ['a'.repeat(200), 'b'.repeat(200)],
+      ]),
+    )
+    expect(parse(many)).toBe(true)
+  })
+
+  it.each([
+    ['a key that is a field key, not a tag', { boletin_titulo: ['Título', 'en Configuración'] }],
+    ['a key with a bad record', { 'Doc:x#title': ['Título', 'en X'] }],
+    ['a bare string', { 'doc:configuracion#boletin_titulo': 'Título' }],
+    ['one string', { 'doc:configuracion#boletin_titulo': ['Título'] }],
+    ['three strings', { 'doc:configuracion#boletin_titulo': ['Título', 'en X', 'y'] }],
+    ['a non-string part', { 'doc:configuracion#boletin_titulo': ['Título', 1] }],
+    ['a label over 200 chars', { 'doc:configuracion#boletin_titulo': ['a'.repeat(201), 'en X'] }],
+    [
+      'a suffix over 200 chars',
+      { 'doc:configuracion#boletin_titulo': ['Título', 'a'.repeat(201)] },
+    ],
+    [
+      `more than ${MAX_LABELS} entries`,
+      Object.fromEntries(
+        Array.from({ length: MAX_LABELS + 1 }, (_, i) => [`blog/x#f${i}`, ['a', 'b']]),
+      ),
+    ],
+    ['an array', [['doc:configuracion#boletin_titulo', ['Título', 'en X']]]],
+  ])('refuses the whole hello for %s', (_name, foreign) => {
+    expect(parseEditorMessage(envelope('zap:hello', SESSION, { ...hello, foreign }))).toEqual({
+      ok: false,
+      reason: 'invalid-payload',
+    })
+  })
+})
+
+describe('zap:click rect and zap:refresh', () => {
+  const click = (extra: Record<string, unknown> = {}) =>
+    parsePageMessage(
+      envelope('zap:click', SESSION, { recordRef: 'blog/x', fieldKey: 'title', ...extra }),
+    ).ok
+
+  it('a click may carry the element box, or not (older clients)', () => {
+    expect(click()).toBe(true)
+    expect(click({ rect: { x: 12, y: 340, w: 300, h: 40 } })).toBe(true)
+    // Partly scrolled out of view: x and y may be negative; an empty box is a box.
+    expect(click({ rect: { x: -20, y: -300, w: 0, h: 0 } })).toBe(true)
+  })
+
+  it.each([
+    ['a negative width', { x: 0, y: 0, w: -1, h: 10 }],
+    ['a negative height', { x: 0, y: 0, w: 10, h: -1 }],
+    ['an infinite x', { x: Infinity, y: 0, w: 10, h: 10 }],
+    ['a NaN y', { x: 0, y: NaN, w: 10, h: 10 }],
+    ['a string width', { x: 0, y: 0, w: '10', h: 10 }],
+    ['a missing height', { x: 0, y: 0, w: 10 }],
+    ['a non-object', 'x'],
+    ['null', null],
+  ])('refuses a click rect with %s', (_name, rect) => {
+    expect(click({ rect })).toBe(false)
+  })
+
+  it('zap:refresh is an editor message with an empty object', () => {
+    expect(parseEditorMessage(envelope('zap:refresh', SESSION, {}))).toEqual({
+      ok: true,
+      message: envelope('zap:refresh', SESSION, {}),
+    })
+    for (const payload of [null, 'reload', 1, undefined]) {
+      expect(parseEditorMessage(envelope('zap:refresh', SESSION, payload))).toEqual({
+        ok: false,
+        reason: 'invalid-payload',
+      })
+    }
+    // Wrong direction.
+    expect(parsePageMessage(envelope('zap:refresh', SESSION, {}))).toEqual({
+      ok: false,
+      reason: 'unknown-type',
+    })
   })
 })

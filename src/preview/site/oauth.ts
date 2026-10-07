@@ -5,7 +5,7 @@ import {
   type CallbackParams,
   type SiteContext,
 } from './config'
-import type { SiteToken } from './token'
+import { REFRESH_LIFETIME_MS, type SiteToken } from './token'
 
 /**
  * The site client's side of OAuth 2.1 with Nest (ADR 024, ADR 041): a public
@@ -21,8 +21,10 @@ import type { SiteToken } from './token'
  * - The code is exchanged once, with the verifier only this tab holds, as a
  *   form POST with no custom header (no preflight; Nest answers CORS to the
  *   client's own redirect origins only) and no cookies.
- * - Nest issues no refresh token to this client; one in the answer anyway is
- *   ignored, never stored.
+ * - Nest answers an hour of access and, since ADR 041's amendment of
+ *   2026-10-06, a short rotating refresh token (eight hours, redeemable only
+ *   inside the remembered consent and from this origin). Both are kept in
+ *   `sessionStorage` only (`token.ts`); `session.ts` spends the refresh.
  */
 
 export interface PendingSignIn {
@@ -122,7 +124,7 @@ export class ExchangeError extends Error {
   }
 }
 
-/** Trade the code for the access token. Never sends cookies; keeps no refresh token. */
+/** Trade the code for the access token (and its refresh token). Never sends cookies. */
 export async function exchangeCode(
   ctx: Pick<SiteContext, 'win' | 'authOrigin' | 'clientId' | 'redirectUri' | 'siteId'>,
   code: string,
@@ -141,9 +143,23 @@ export async function exchangeCode(
     }),
   })
   if (!response.ok) throw new ExchangeError(response.status)
+  return readTokenAnswer(response, ctx.siteId, now)
+}
+
+/**
+ * The token endpoint's answer, checked: an `eel_at_` token and its lifetime
+ * (at most the hour the ADR promises, whatever the answer claims), and the
+ * `eel_rt_` refresh token when there is one (eight hours at most).
+ */
+export async function readTokenAnswer(
+  response: Response,
+  siteId: string,
+  now = Date.now(),
+): Promise<SiteToken> {
   const body = (await response.json().catch(() => null)) as {
     access_token?: unknown
     expires_in?: unknown
+    refresh_token?: unknown
   } | null
   const token = body?.access_token
   const expiresIn = body?.expires_in
@@ -155,8 +171,12 @@ export async function exchangeCode(
   ) {
     throw new ExchangeError(502)
   }
-  // At most the hour the ADR promises, whatever the answer claims.
-  return { token, exp: now + Math.min(expiresIn, 3600) * 1000, site: ctx.siteId }
+  const refresh = body?.refresh_token
+  const withRefresh =
+    typeof refresh === 'string' && /^eel_rt_[A-Za-z0-9_-]{8,200}$/.test(refresh)
+      ? { refresh, rexp: now + REFRESH_LIFETIME_MS }
+      : {}
+  return { token, exp: now + Math.min(expiresIn, 3600) * 1000, site: siteId, ...withRefresh }
 }
 
 // ── The pending full-page sign-in (sessionStorage, this tab only) ───────────

@@ -1,4 +1,4 @@
-import { splitStega } from '../stega'
+import { cleanStega, splitStega } from '../stega'
 import type { PreviewValue, ValuesPayload } from './protocol'
 import {
   isSafeImageUrl,
@@ -68,7 +68,13 @@ export class ValueApplier {
   /** Remember and apply a patch. Returns how many elements were written. */
   apply(payload: ValuesPayload): number {
     let written = 0
-    for (const [fieldKey, value] of Object.entries(payload.patch)) {
+    for (const [fieldKey, raw] of Object.entries(payload.patch)) {
+      // Never a marker from a value: a stega text node keeps ITS markers and
+      // appends the value, so a value carrying markers (text copied from a
+      // preview into the form) would add more on every pass, and each new
+      // marker is one more tagged entry at the next scan — the index and the
+      // node grow without bound until the tab runs out of memory.
+      const value = cleanStega(raw)
       this.desired.set(`${payload.recordRef}#${fieldKey}`, { locale: payload.locale, value })
       for (const tagged of this.index.byField(payload.recordRef, fieldKey)) {
         if (this.write(tagged, payload.locale, value)) written++

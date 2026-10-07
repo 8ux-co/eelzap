@@ -173,7 +173,7 @@ async function ready(locale: 'es' | 'en' = 'es', options: StartOptions = {}) {
 const PAGE_URL = () => `${window.location.origin}/blog/hola?utm=x`
 
 describe('the toolbar (SitioBarra)', () => {
-  it('renders in a closed shadow root: Navegar, Editar, Comentar, the open count, initials, Salir', async () => {
+  it('renders in a closed shadow root: Navegar, Editar, Comentar, the open count, the account chip (no Salir)', async () => {
     await ready()
     const host = document.documentElement.querySelector('eel-zap-site')!
     expect(host.shadowRoot).toBeNull()
@@ -188,7 +188,9 @@ describe('the toolbar (SitioBarra)', () => {
     ])
     expect(toolbar.textContent).toContain('1 abierto')
     expect(toolbar.textContent).toContain('CR')
-    expect(toolbar.textContent).toContain('Salir')
+    // Salir moved into the account menu (SitioBarraEstados).
+    expect(toolbar.textContent).not.toContain('Salir')
+    expect(toolbar.querySelector('[data-action="exit"]')).toBeNull()
     expect(toolbar.textContent).not.toMatch(/Sugerir|Seleccionar/)
     // Navegar first: nothing on the page is taken over until the person picks a tool.
     expect(tool('navigate').getAttribute('aria-pressed')).toBe('true')
@@ -206,12 +208,14 @@ describe('the toolbar (SitioBarra)', () => {
   })
 
   it.each([
-    ['es', ['Navegar', 'Editar', 'Comentar', 'Salir'], ['Browse', 'Sign out', '1 open']],
-    ['en', ['Browse', 'Edit', 'Comment', 'Sign out'], ['Navegar', 'Editar', 'Comentar', 'Salir']],
+    ['es', ['Navegar', 'Editar', 'Comentar', '1 abierto'], ['Browse', 'Comment', '1 open']],
+    ['en', ['Browse', 'Edit', 'Comment', '1 open'], ['Navegar', 'Editar', 'Comentar', 'abierto']],
   ] as const)('speaks %s only', async (locale, own, other) => {
     await ready(locale)
-    for (const word of own) expect(root().textContent).toContain(word)
-    for (const word of other) expect(root().textContent).not.toContain(word)
+    // Read the toolbar, not the root: the root also holds the style sheet.
+    const text = root().querySelector('[role="toolbar"]')!.textContent
+    for (const word of own) expect(text).toContain(word)
+    for (const word of other) expect(text).not.toContain(word)
   })
 
   it('Navegar intercepts nothing', async () => {
@@ -222,9 +226,10 @@ describe('the toolbar (SitioBarra)', () => {
     expect(popover()).toBeNull()
   })
 
-  it('Salir forgets the token and closes', async () => {
+  it('«Cerrar sesión en Zap» (the account menu) forgets the token and closes', async () => {
     await ready()
-    action('exit').click()
+    action('account').click()
+    action('sign-out').click()
     expect(readToken(window, SITE)).toBeNull()
     expect(ctx.close).toHaveBeenCalled()
   })
@@ -751,7 +756,7 @@ describe('when Zap says no', () => {
     expect(root().querySelector('[role="toolbar"]')).toBeNull()
   })
 
-  it('401: forgets the token and asks to sign in again', async () => {
+  it('401 with nothing to renew with: «Tu sesión de Zap expiró», never the refusal; «Volver a entrar» signs in at once', async () => {
     routes.draft = () => json({ error: { code: 'UNAUTHORIZED' } }, 401)
     await ready()
     tool('edit').click()
@@ -760,7 +765,10 @@ describe('when Zap says no', () => {
     leave($('h1'))
     await tick()
     expect(readToken(window, SITE)).toBeNull()
-    expect(ctx.open).toHaveBeenCalledWith('signin', { reason: 'expired' })
+    expect(root().textContent).toContain('Tu sesión de Zap expiró')
+    expect(root().textContent).not.toContain('No puedes editar ni comentar')
+    action('sign-in-again').click()
+    expect(ctx.open).toHaveBeenCalledWith('signin', { reason: 'expired', signIn: true })
   })
 
   it('no live token at start: straight to the sign-in prompt, nothing drawn', () => {
@@ -886,7 +894,8 @@ describe('pins and text-only rendering', () => {
     expect(shadow.textContent).toContain(evil)
     expect(overlayRoot().querySelector('img, script, b, i')).toBeNull()
     expect((window as unknown as { __pwned?: number }).__pwned).toBeUndefined()
-    expect(shadow.querySelector('.avatar')!.getAttribute('title')).toBe('<b>Mallory</b> X')
+    // The name reaches the bar only as the account chip's accessible name, as text.
+    expect(action('account').getAttribute('aria-label')).toBe('<b>Mallory</b> X, cuenta')
     expect(byText(shadow, evil, 'span')).not.toBeNull()
   })
 })

@@ -11,10 +11,27 @@ const runtimes: PageRuntime[] = []
 afterEach(() => {
   while (runtimes.length) runtimes.pop()!.destroy()
   document.body.innerHTML = ''
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+  localStorage.clear()
 })
 
+/**
+ * The real window, with `location` swapped for a fake (jsdom's own cannot be
+ * spied on); everything else reaches the real one.
+ */
+function windowWithLocation(location: Partial<Location>): Window {
+  return new Proxy(window, {
+    get(target, key) {
+      if (key === 'location') return location
+      const value = Reflect.get(target, key)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
 /** The runtime as the Live client starts it (`live.ts`): no session until the hello. */
-function boot(html: string) {
+function boot(html: string, win: Window = window) {
   document.body.innerHTML = html
   const parent = { postMessage: vi.fn() }
   let pageUrl = PAGE_URL
@@ -24,7 +41,7 @@ function boot(html: string) {
       pageUrl: () => pageUrl,
       lazyOverlay: true,
     },
-    { win: window, doc: document, parent, throttleMs: 0 },
+    { win, doc: document, parent, throttleMs: 0 },
   )
   runtimes.push(runtime)
   const deliver = (type: string, payload: unknown) =>
@@ -40,7 +57,7 @@ function boot(html: string) {
       expect(target).toBe(ZAP)
       return message as { type: string; payload: unknown; session: string }
     })
-  const hello = (mode: 'inspect' | 'select' | 'off' = 'inspect') =>
+  const hello = (mode: 'inspect' | 'select' | 'off' = 'inspect', extra: object = {}) =>
     deliver('zap:hello', {
       session: SESSION,
       siteKey: 'main',
@@ -49,6 +66,7 @@ function boot(html: string) {
       recordRef: 'blog/hola',
       mode,
       zoom: 0.5,
+      ...extra,
     })
   const moveTo = (url: string) => {
     pageUrl = url
@@ -73,7 +91,7 @@ describe('page runtime', () => {
     expect(messages[0]).toMatchObject({
       session: '',
       payload: {
-        capabilities: ['overlay', 'values', 'stega', 'pins', 'links'],
+        capabilities: ['overlay', 'values', 'stega', 'pins', 'links', 'refresh'],
         pageUrl: PAGE_URL,
         draftRoute: null,
       },
@@ -111,7 +129,6 @@ describe('page runtime', () => {
     expect(document.querySelector('h1')!.textContent).toBe('Nuevo título')
     expect(document.querySelector('[data-zap-html]')!.innerHTML).toBe('<p>Nuevo cuerpo</p>')
 
-    document.querySelector('h1')!.scrollIntoView = vi.fn()
     deliver('zap:focus-field', { recordRef: 'blog/hola', fieldKey: 'title' })
     runtime.overlay.render()
     expect(runtime.overlay.inspect().boxes.map((b) => b.kind)).toEqual(['focus'])
@@ -214,7 +231,6 @@ describe('page runtime', () => {
   it('highlights change-request anchors, surviving a hostile selector', () => {
     const { runtime, deliver, hello } = boot(PAGE)
     hello()
-    document.querySelector('#free')!.scrollIntoView = vi.fn()
     deliver('zap:highlight', {
       anchors: [
         {
@@ -280,5 +296,121 @@ describe('page runtime', () => {
     hello('off')
     expect(runtime.overlay.getMode()).toBe('off')
     expect(runtime.bridge.stats['wrong-source']).toBe(1)
+  })
+
+  it('says ready again at 500 ms, 1.5 s and 4 s until a hello comes, and never after it', () => {
+    vi.useFakeTimers()
+    const readies = (posted: () => Array<{ type: string }>) =>
+      posted().filter((m) => m.type === 'zap:ready').length
+    const late = boot(PAGE)
+    expect(readies(late.posted)).toBe(1)
+    vi.advanceTimersByTime(499)
+    expect(readies(late.posted)).toBe(1)
+    vi.advanceTimersByTime(1)
+    expect(readies(late.posted)).toBe(2)
+    vi.advanceTimersByTime(1000)
+    expect(readies(late.posted)).toBe(3)
+    vi.advanceTimersByTime(2500)
+    expect(readies(late.posted)).toBe(4)
+    vi.advanceTimersByTime(60_000)
+    expect(readies(late.posted)).toBe(4)
+    late.runtime.destroy()
+
+    // A hello before the first retry: the ready is never said again.
+    const { posted, hello } = boot(PAGE)
+    hello()
+    vi.advanceTimersByTime(60_000)
+    expect(readies(posted)).toBe(1)
+  })
+
+  it('a hello between the retries stops the ones left', () => {
+    vi.useFakeTimers()
+    const { posted, hello } = boot(PAGE)
+    vi.advanceTimersByTime(600)
+    hello()
+    vi.advanceTimersByTime(60_000)
+    expect(posted().filter((m) => m.type === 'zap:ready')).toHaveLength(2)
+  })
+
+  it('a page restored from the back-forward cache says ready again; a fresh pageshow does not', () => {
+    const { posted, hello } = boot(PAGE)
+    hello()
+    const readies = () => posted().filter((m) => m.type === 'zap:ready')
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }))
+    expect(readies()).toHaveLength(1)
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))
+    expect(readies()).toHaveLength(2)
+    expect(readies()[1]!.payload).toMatchObject({ pageUrl: PAGE_URL })
+  })
+
+  it("logs each tags report and its cause with localStorage['eelzap:debug'] set", () => {
+    localStorage.setItem('eelzap:debug', '1')
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const { hello } = boot(PAGE)
+    hello()
+    const tagLogs = debug.mock.calls.filter(([prefix, what]) => {
+      expect(prefix).toBe('[zap:fields]')
+      return what === 'tags'
+    })
+    expect(tagLogs.map((call) => call[2])).toEqual(['ready', 'hello'])
+    expect(tagLogs[0]).toEqual(['[zap:fields]', 'tags', 'ready', 2, PAGE_URL, null])
+    expect(tagLogs[1]).toEqual(['[zap:fields]', 'tags', 'hello', 2, PAGE_URL, SESSION])
+  })
+
+  it('logs nothing without the debug key', () => {
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {})
+    const { hello, deliver } = boot(PAGE)
+    hello()
+    deliver('zap:values', { recordRef: 'blog/hola', locale: 'es', patch: { title: 'Nuevo' } })
+    expect(debug).not.toHaveBeenCalled()
+  })
+
+  it('zap:refresh from the editor reloads the page in place', () => {
+    const reload = vi.fn()
+    const { deliver, hello } = boot(PAGE, windowWithLocation({ href: PAGE_URL, reload }))
+    hello()
+    expect(reload).not.toHaveBeenCalled()
+    deliver('zap:refresh', {})
+    expect(reload).toHaveBeenCalledTimes(1)
+  })
+
+  it("zap:click carries the clicked element's box in the frame's viewport", () => {
+    const { posted, hello } = boot(PAGE)
+    hello('inspect')
+    const h1 = document.querySelector('h1')!
+    vi.spyOn(h1, 'getBoundingClientRect').mockReturnValue({
+      x: 12,
+      y: 340,
+      left: 12,
+      top: 340,
+      right: 312,
+      bottom: 380,
+      width: 300,
+      height: 40,
+    } as DOMRect)
+    h1.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    expect(posted().at(-1)).toMatchObject({
+      type: 'zap:click',
+      payload: {
+        recordRef: 'blog/hola',
+        fieldKey: 'title',
+        rect: { x: 12, y: 340, w: 300, h: 40 },
+      },
+    })
+  })
+
+  it("the hello's foreign labels reach the overlay: a field of another record names its record", () => {
+    const foreign = { 'doc:configuracion#boletin_titulo': ['Título', 'en Configuración'] }
+    const { runtime, hello } = boot(
+      `${PAGE}<p id="news" data-zap="doc:configuracion#boletin_titulo">Boletín</p>`,
+    )
+    const setLabels = vi.spyOn(runtime.overlay, 'setLabels')
+    hello('inspect', { foreign })
+    expect(setLabels).toHaveBeenCalledWith({ title: 'Título' }, foreign)
+    document.querySelector('#news')!.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
+    runtime.overlay.render()
+    expect(runtime.overlay.inspect().boxes).toEqual([
+      { kind: 'hover', label: 'Títuloen Configuración' },
+    ])
   })
 })

@@ -16,11 +16,11 @@
 export const DEFAULT_SHORTCUT = 'Z'
 
 /**
- * Where typing happens: the target itself or anything it sits in. Any
- * `contenteditable`, even `false`, counts: a few bytes of the boot cheaper,
- * and a missed shortcut there costs nothing.
+ * Where typing happens: the target itself or anything it sits in. A
+ * `contenteditable="false"` region is not typing, so the shortcut still works
+ * there; a field being edited on the live site is, so Shift+Z types a capital.
  */
-const TYPING = 'input,textarea,select,[contenteditable]'
+const TYPING = 'input,textarea,select,[contenteditable]:not([contenteditable="false"])'
 
 export function isShortcut(event: KeyboardEvent, key: string): boolean {
   // The real target, inside an open shadow root too (a site's own components).

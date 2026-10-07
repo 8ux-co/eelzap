@@ -132,12 +132,12 @@ describe('the code exchange', () => {
   const answer = (body: unknown, status = 200) =>
     vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify(body), { status }))
 
-  it('posts the form with the verifier, no cookies, no custom header, and keeps no refresh token', async () => {
+  it('posts the form with the verifier, no cookies, no custom header, and keeps the refresh token', async () => {
     const fetchMock = answer({
       access_token: 'eel_at_ABCDEFGHIJKL_0123456789',
       token_type: 'Bearer',
       expires_in: 3600,
-      refresh_token: 'eel_rt_should_never_be_kept',
+      refresh_token: 'eel_rt_ABCDEFGHIJKL_0123456789',
     })
     const token = await exchangeCode(CTX, 'the-code', 'the-verifier', 1_000)
     const [url, init] = fetchMock.mock.calls[0]!
@@ -152,11 +152,24 @@ describe('the code exchange', () => {
       redirect_uri: CTX.redirectUri,
       code_verifier: 'the-verifier',
     })
+    // ADR 041 amendment 2026-10-06: the eight-hour refresh token is kept, with its horizon.
     expect(token).toEqual({
       token: 'eel_at_ABCDEFGHIJKL_0123456789',
       exp: 1_000 + 3_600_000,
       site: SITE,
+      refresh: 'eel_rt_ABCDEFGHIJKL_0123456789',
+      rexp: 1_000 + 8 * 3_600_000,
     })
+  })
+
+  it("keeps no refresh token that is not shaped like Nest's", async () => {
+    answer({
+      access_token: 'eel_at_ABCDEFGHIJKL_0123456789',
+      expires_in: 3600,
+      refresh_token: 'eel_rt_<script>',
+    })
+    const token = await exchangeCode(CTX, 'c', 'v', 0)
+    expect(token.refresh).toBeUndefined()
     expect(JSON.stringify(token)).not.toContain('eel_rt_')
   })
 

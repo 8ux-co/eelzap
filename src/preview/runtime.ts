@@ -1,8 +1,14 @@
 import { buildAnchor, findAnchorElement } from './anchor'
 import { Overlay } from './overlay'
 import { createPageBridge, type MessageTargetLike, type PageBridge } from './page-bridge'
-import { CAPABILITIES, PAGE_UNLOAD_ERROR, type EditorMessage, type TagSummary } from './protocol'
-import { observeTags, TagIndex, type TagProblem } from './tags'
+import {
+  CAPABILITIES,
+  PAGE_UNLOAD_ERROR,
+  type EditorMessage,
+  type PausedPayload,
+  type TagSummary,
+} from './protocol'
+import { observeTags, TagIndex, tagGuard, type TagProblem } from './tags'
 import { ValueApplier } from './values'
 
 /**
@@ -25,7 +31,7 @@ export interface PageRuntime {
   readonly bridge: PageBridge
   readonly index: TagIndex
   readonly overlay: Overlay
-  /** Force a rescan + report now (specs, and after a navigation). */
+  /** Force a rescan + report now (specs, and after a navigation); nothing once paused. */
   refresh(): void
   destroy(): void
 }
@@ -67,13 +73,34 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
   let lastReport = ''
   const reportedProblems = new Set<string>()
   let stopObserving: () => void = () => {}
+  // The runaway guard (`tagGuard`): once paused, nothing is scanned or written.
+  const guard = tagGuard()
+  let paused: PausedPayload | null = null
+  /**
+   * `localStorage['eelzap:debug']` set (any value) on the site's origin:
+   * `console.debug('[zap:fields]', …)` for every tags report and its cause,
+   * and every editor message dropped (a wrong session drops them all).
+   */
+  let debug = false
+  try {
+    debug = !!win.localStorage.getItem('eelzap:debug')
+  } catch {
+    // Blocked storage: no logs.
+  }
+  const log = (...args: unknown[]) => debug && console.debug('[zap:fields]', ...args)
 
   const overlay = new Overlay({
     doc,
     win,
     index,
-    onInspect: (tagged) =>
-      bridge.post('zap:click', { recordRef: tagged.recordRef, fieldKey: tagged.fieldKey }),
+    onInspect: (tagged) => {
+      const { x, y, width: w, height: h } = tagged.element.getBoundingClientRect()
+      bridge.post('zap:click', {
+        recordRef: tagged.recordRef,
+        fieldKey: tagged.fieldKey,
+        rect: { x, y, w, h },
+      })
+    },
     onSelect: (elements) =>
       bridge.post('zap:select', {
         anchors: elements.map((element) => buildAnchor(element, index, config.pageUrl(), doc, win)),
@@ -89,6 +116,8 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     parent,
     editorOrigins: config.editorOrigins,
     preHelloTargets: config.preHelloTargets,
+    // Any window may post to the page: only drops from the editor are news.
+    onDrop: (reason) => reason !== 'wrong-source' && log('drop', reason),
     onMessage: (message) => {
       if (config.accept && !config.accept(message)) return
       handle(message)
@@ -100,18 +129,21 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     switch (message.type) {
       case 'zap:hello': {
         const hello = message.payload
+        greeted = true
         overlay.mount()
-        overlay.setLabels(hello.labels)
+        overlay.setLabels(hello.labels, hello.foreign)
         overlay.setTheme(hello.theme)
         if (hello.zoom !== undefined) overlay.setZoom(hello.zoom)
         overlay.setMode(hello.mode)
         // The editor may have missed the load-time report (it was not
         // listening yet), so the hello is answered with the current tags.
-        report(true)
+        report('hello', true)
+        // A pause before the hello never reached the editor.
+        if (paused) bridge.post('zap:paused', paused)
         return
       }
       case 'zap:values':
-        values.apply(message.payload)
+        if (!paused) values.apply(message.payload)
         return
       case 'zap:focus-field':
         overlay.focusField(
@@ -123,6 +155,10 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
         return
       case 'zap:zoom':
         overlay.setZoom(message.payload.zoom)
+        return
+      case 'zap:refresh':
+        log('refresh')
+        win.location.reload()
         return
       case 'zap:highlight': {
         const found = message.payload.anchors
@@ -145,12 +181,13 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     }
   }
 
-  function report(force = false): void {
+  function report(why: string, force = false): void {
     const summary: TagSummary[] = index.summary()
     const key = JSON.stringify(summary)
     if (force || key !== lastReport) {
       lastReport = key
       bridge.post('zap:tags', summary)
+      log('tags', why, summary.length, config.pageUrl(), bridge.session)
     }
     reportProblems(index.problems)
   }
@@ -168,10 +205,24 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
   // shows up as DOM mutations, so the rescan notices the new URL and tells the
   // editor. A real navigation loads a new document, which says ready again.
   let lastUrl = config.pageUrl()
-  function refresh(): void {
+  /** Rescan; false once the guard paused the page (it stops observing, writes nothing more). */
+  function scan(page: boolean): boolean {
+    if (paused) return false
     index.scan()
+    const count = index.elements.length
+    const reason = guard(count, page)
+    if (!reason) return true
+    paused = { reason, count }
+    stopObserving()
+    console.warn('eelzap: preview paused', paused)
+    bridge.post('zap:paused', paused)
+    return false
+  }
+
+  function refresh(page = true): void {
+    if (!scan(page)) return
     values.reapply()
-    report()
+    report(page ? 'mutation' : 'reapply')
     const url = config.pageUrl()
     if (url !== lastUrl) {
       lastUrl = url
@@ -185,27 +236,46 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
   const onPageHide = () => {
     bridge.post('zap:error', { code: PAGE_UNLOAD_ERROR })
   }
-
-  if (!config.lazyOverlay) overlay.install()
-  win.addEventListener('pagehide', onPageHide)
-
-  function boot(): void {
-    if (!config.lazyOverlay) overlay.mount()
-    index.scan()
-    stopObserving = observeTags(doc.documentElement, refresh, {
-      throttleMs: options.throttleMs,
-      ignore: (node) => {
-        const host = overlay.hostElement
-        return !!host && (node === host || host.contains(node))
-      },
-    })
+  // A document restored from the back-forward cache never loads again: it
+  // says ready again, and the editor answers with its hello.
+  const onPageShow = (event: PageTransitionEvent) => {
+    if (event.persisted) {
+      log('pageshow')
+      announce()
+    }
+  }
+  /** Whether a hello arrived: until then, `zap:ready` is said again. */
+  let greeted = false
+  function announce(): void {
+    log('ready', config.pageUrl())
     bridge.post('zap:ready', {
       version: CLIENT_VERSION,
       capabilities: [...CAPABILITIES],
       pageUrl: config.pageUrl(),
       draftRoute: config.draftRoute ?? null,
     })
-    report(true)
+  }
+
+  if (!config.lazyOverlay) overlay.install()
+  win.addEventListener('pagehide', onPageHide)
+  win.addEventListener('pageshow', onPageShow)
+
+  function boot(): void {
+    if (!config.lazyOverlay) overlay.mount()
+    if (scan(true)) {
+      stopObserving = observeTags(doc.documentElement, refresh, {
+        throttleMs: options.throttleMs,
+        ignore: (node) => {
+          const host = overlay.hostElement
+          return !!host && (node === host || host.contains(node))
+        },
+      })
+    }
+    announce()
+    report('ready', true)
+    // An editor whose listener mounted after this ready (a soft navigation in
+    // Zap) never answers it: say it again until a hello comes.
+    for (const ms of [500, 1500, 4000]) win.setTimeout(() => greeted || announce(), ms)
   }
 
   if (doc.readyState === 'loading') {
@@ -222,6 +292,7 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     destroy() {
       stopObserving()
       win.removeEventListener('pagehide', onPageHide)
+      win.removeEventListener('pageshow', onPageShow)
       overlay.destroy()
       bridge.destroy()
     },

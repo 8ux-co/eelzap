@@ -46,6 +46,11 @@ import { isFieldKey, isPreviewTokenShape, isRecordRef, type RecordRef } from '..
  *   a URL field's value is `{ url }` and an EMAIL field's `{ email }`, so the
  *   page writes a link's `href` (`mailto:` for an email) and leaves its label
  *   alone (`values.ts`). Older clients get the bare string, as before.
+ * - `zap:paused` (page → editor) `{ reason, count }`: the runaway guard
+ *   (`tagGuard` in `tags.ts`) stopped following the page: `cap` past 5,000
+ *   tagged elements, `runaway` when the count kept growing with nothing on
+ *   the page explaining it. The page stops writing values; the editor offers
+ *   a reload. Sent again after a hello, which a pause before it never reached.
  */
 
 export const PROTOCOL_SOURCE = 'eel-zap'
@@ -74,9 +79,16 @@ export const MAX_PINS = 50
 export type OverlayMode = 'inspect' | 'select' | 'spot' | 'off'
 export const OVERLAY_MODES: readonly OverlayMode[] = ['inspect', 'select', 'spot', 'off']
 
-export type Capability = 'overlay' | 'values' | 'stega' | 'pins' | 'links'
+export type Capability = 'overlay' | 'values' | 'stega' | 'pins' | 'links' | 'refresh'
 /** Every capability; a client built from this source advertises all of them. */
-export const CAPABILITIES: readonly Capability[] = ['overlay', 'values', 'stega', 'pins', 'links']
+export const CAPABILITIES: readonly Capability[] = [
+  'overlay',
+  'values',
+  'stega',
+  'pins',
+  'links',
+  'refresh',
+]
 
 export {
   FIELD_KEY_RE,
@@ -186,6 +198,14 @@ export interface HelloPayload {
   zoom?: number
   /** Live only: the draft-mode token for the cookieless fallback. */
   previewToken?: string
+  /**
+   * Fields on the page that belong to ANOTHER record than `recordRef` (a
+   * site-wide document in the header, a related entry): the full tag
+   * (`TagSummary.tag`, `recordRef#fieldKey`) to `[label, suffix]`, the suffix
+   * already localized («en Configuración»). The chip draws the label, then
+   * the suffix muted. At most `MAX_LABELS`; optional, older clients ignore it.
+   */
+  foreign?: Record<string, [label: string, suffix: string]>
 }
 
 /** Colours the editor may override; `#rgb` / `#rrggbb` only. */
@@ -204,6 +224,14 @@ export interface ValuesPayload {
 export interface FieldRefPayload {
   recordRef: RecordRef
   fieldKey: string
+}
+
+/**
+ * `zap:click`: the field, and optionally the clicked element's box in the
+ * frame's viewport, CSS px before the editor's zoom (older clients omit it).
+ */
+export interface ClickPayload extends FieldRefPayload {
+  rect?: { x: number; y: number; w: number; h: number }
 }
 
 /** A point as fractions (0..1) of the whole document, not the viewport (§3.3). */
@@ -233,15 +261,22 @@ export type Pin = { id: string; n: number } & (
   | { dom: DomAnchor; spot?: undefined }
 )
 
+/** `zap:paused`: why the page stopped following itself, and the tagged count then. */
+export interface PausedPayload {
+  reason: 'runaway' | 'cap'
+  count: number
+}
+
 export interface PageMessages {
   'zap:ready': ReadyPayload
   'zap:tags': TagSummary[]
-  'zap:click': FieldRefPayload
+  'zap:click': ClickPayload
   'zap:select': { anchors: PageAnchor[] }
   'zap:navigate': { url: string }
   'zap:error': { code: string; detail?: string }
   'zap:spot': SpotPayload
   'zap:pin': { id: string }
+  'zap:paused': PausedPayload
 }
 
 export interface EditorMessages {
@@ -250,6 +285,12 @@ export interface EditorMessages {
   'zap:focus-field': FieldRefPayload
   'zap:mode': OverlayMode
   'zap:zoom': { zoom: number }
+  /**
+   * Reload the page in place (`refresh` capability): for values the overlay
+   * cannot place, once the draft is saved. The browser keeps the scroll and
+   * the draft-mode cookie keeps the draft; the new document says ready.
+   */
+  'zap:refresh': Record<string, never>
   'zap:highlight': { anchors: DomAnchor[] }
   'zap:pins': { pins: Pin[] }
 }
@@ -400,7 +441,7 @@ export function isPin(value: unknown): value is Pin {
   )
 }
 
-function isFieldRef(value: unknown): value is FieldRefPayload {
+function isFieldRef(value: unknown): value is FieldRefPayload & Record<string, unknown> {
   return isObject(value) && isRecordRef(value.recordRef) && isFieldKey(value.fieldKey)
 }
 
@@ -526,7 +567,14 @@ const PAGE_VALIDATORS: { [K in PageMessageType]: (p: unknown) => boolean } = {
         (t.count as number) > 0 &&
         (t.source === undefined || t.source === 'stega' || t.source === 'attr'),
     ),
-  'zap:click': isFieldRef,
+  'zap:click': (p) =>
+    isFieldRef(p) &&
+    (p.rect === undefined ||
+      (isObject(p.rect) &&
+        isFiniteNumber(p.rect.x, -1e7, 1e7) &&
+        isFiniteNumber(p.rect.y, -1e7, 1e7) &&
+        isFiniteNumber(p.rect.w, 0, 1e7) &&
+        isFiniteNumber(p.rect.h, 0, 1e7))),
   'zap:select': (p) => isObject(p) && isAnchorList(p.anchors, isPageAnchor),
   'zap:navigate': (p) => isObject(p) && isHttpUrl(p.url),
   'zap:error': (p) =>
@@ -542,6 +590,11 @@ const PAGE_VALIDATORS: { [K in PageMessageType]: (p: unknown) => boolean } = {
     isFiniteNumber(p.viewport.h, 1, 10_000_000) &&
     isHttpUrl(p.pageUrl),
   'zap:pin': (p) => isObject(p) && isPinId(p.id),
+  'zap:paused': (p) =>
+    isObject(p) &&
+    (p.reason === 'runaway' || p.reason === 'cap') &&
+    Number.isInteger(p.count) &&
+    (p.count as number) >= 0,
 }
 
 const EDITOR_VALIDATORS: { [K in EditorMessageType]: (p: unknown) => boolean } = {
@@ -551,12 +604,22 @@ const EDITOR_VALIDATORS: { [K in EditorMessageType]: (p: unknown) => boolean } =
     if (p.theme !== undefined && !isTheme(p.theme)) return false
     if (p.zoom !== undefined && !isZoom(p.zoom)) return false
     if (p.previewToken !== undefined && !isPreviewTokenShape(p.previewToken)) return false
-    const labels = p.labels
-    if (!isObject(labels)) return false
-    const entries = Object.entries(labels)
+    // Both maps capped and checked entry by entry: labels by field key,
+    // `foreign` by full tag to `[label, suffix]`.
+    const within = (map: unknown, ok: (key: string, value: unknown) => boolean) =>
+      isObject(map) &&
+      Object.keys(map).length <= MAX_LABELS &&
+      Object.entries(map).every(([key, value]) => ok(key, value))
     return (
-      entries.length <= MAX_LABELS &&
-      entries.every(([key, label]) => isFieldKey(key) && isString(label, 200))
+      within(p.labels, (key, label) => isFieldKey(key) && isString(label, 200)) &&
+      within(
+        p.foreign ?? {},
+        (tag, pair) =>
+          !!parseTag(tag) &&
+          Array.isArray(pair) &&
+          pair.length === 2 &&
+          pair.every((part) => isString(part, 200)),
+      )
     )
   },
   'zap:values': (p) => {
@@ -568,6 +631,7 @@ const EDITOR_VALIDATORS: { [K in EditorMessageType]: (p: unknown) => boolean } =
   'zap:focus-field': isFieldRef,
   'zap:mode': isMode,
   'zap:zoom': (p) => isObject(p) && isZoom(p.zoom),
+  'zap:refresh': isObject,
   'zap:highlight': (p) => isObject(p) && isAnchorList(p.anchors, isDomAnchor),
   'zap:pins': (p) =>
     isObject(p) && Array.isArray(p.pins) && p.pins.length <= MAX_PINS && p.pins.every(isPin),

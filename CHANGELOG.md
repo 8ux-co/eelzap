@@ -5,7 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.0] - Unreleased
+## [0.10.1] - Unreleased
+
+### Added
+
+- The site client's on-page read returns the viewer's own `email` and an `editorUrl` for the record the page resolves to («Abrir en Zap»), plus `records` naming the other records the page shows.
+- **`webhookChanges` covers SEO, collection, schema and site events**, so a
+  site that revalidates on webhooks also refreshes when they change:
+  - `zap.seo.updated` gives the same `item` or `document` change an edit
+    does (action `updated`), one per entry or document;
+  - `zap.collection.created`, `updated` and `deleted` give a `collection`
+    change carrying `collectionKey`;
+  - `zap.schema.field_changed` (action `field_changed`) gives one
+    `collection` change per collection whose fields changed, with
+    `resourceKey` and `collectionKey` set to the collection's key, and one
+    `document` change per document whose fields changed, named by the
+    document's key. Zap now sends `collection_key` and `document_key` on
+    every schema change. An older payload without them names a collection
+    by its id (no `collectionKey`) and widens a document's fields to one
+    `site` change;
+  - `zap.site.updated` gives a `site` change.
+- `WebhookEventType` adds `'collection'` and `'site'`, and `WebhookAction`
+  adds `'field_changed'`. The item, document and media changes keep their
+  shape.
+- Typed `data` for these events: `WebhookSeoEventData`,
+  `WebhookCollectionEventData`, `WebhookSchemaEventData` (with optional
+  `collection_key` and `document_key`) and `WebhookSiteEventData`.
+
+### Changed
+
+- **`canonicalUrl` takes a path or a full URL** (`SeoInput`, docs only; the
+  type is still `string | null`). A path such as `/blog/original-post` is
+  stored as sent and resolved against the site URL on delivery, so it
+  follows a change of address; a full https URL (http only on localhost) is
+  kept as sent, for content first published on another domain. Leave it
+  unset and delivery uses the record's own URL. Zap refuses `//host`,
+  `javascript:` and other schemes, whitespace and credentials with a 400
+  whose `details[].message` says why.
+- `Seo.canonicalUrl` on delivery is always an absolute URL or null, as
+  before; a stored path arrives resolved. `VersionSeo.canonicalUrl` and the
+  SEO routes return the value as stored.
+- The canonical is an SEO field only: it no longer changes the page Zap's
+  preview opens. Where a record lives is its preview path.
+- **A document without a preview path is site-wide** (a header and footer
+  document, say): `Seo.canonicalUrl` and `ogUrl` are null for it unless an
+  editor set a canonical, instead of `/{documentKey}`. A document that is a
+  page keeps its preview path's URL.
+- **Zap keeps every version.** The per-site version limit is gone, so
+  `WebhookSiteEventData.changed` on `zap.site.updated` never lists
+  `maxVersionsPerEntry`, and `itemVersions.list()` and `documentVersions.list()`
+  return the whole history. No SDK type carried the setting, so no code changes.
+
+### Fixed
+
+- `webhookChanges` returns an empty list for `zap.item.draft_updated` and
+  `zap.document.draft_updated`: saving a draft changes nothing the live site
+  serves.
+- **The preview client pauses instead of running away.** When the tagged
+  count passes 5,000, or grows on three passes in a row that nothing on the
+  page explains, the client stops observing the page and writing values,
+  logs one warning and tells Zap's editor (`zap:paused`), which offers a
+  reload. Values carrying stega markers no longer add markers on each pass.
+
+## [0.10.0] - 2026-10-06
 
 The first release as **`@8ux-co/eelzap`**, which replaces
 `@8ux-co/eelzap-api-sdk-ts` (its last release, 0.9.1, points here). One

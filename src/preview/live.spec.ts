@@ -350,10 +350,10 @@ describe('initZap: draft route, stega and values for code bundled apart (zap-cms
   const readyOf = (parent: { postMessage: ReturnType<typeof vi.fn> }) =>
     parent.postMessage.mock.calls.map(([m]) => m).find((m) => m.type === 'zap:ready')!.payload
 
-  it('announces the draft-mode route path and the stega, pins and links capabilities in zap:ready', () => {
+  it('announces the draft-mode route path and the stega, pins, links and refresh capabilities in zap:ready', () => {
     const { parent } = boot({ draftRoute: '/api/zap-preview' })
     expect(readyOf(parent)).toMatchObject({
-      capabilities: ['overlay', 'values', 'stega', 'pins', 'links'],
+      capabilities: ['overlay', 'values', 'stega', 'pins', 'links', 'refresh'],
       draftRoute: '/api/zap-preview',
     })
   })
@@ -417,5 +417,73 @@ describe('initZap: draft route, stega and values for code bundled apart (zap-cms
       locale: 'es',
       patch: { title: 'Borrador' },
     })
+  })
+})
+
+describe('initZap: a renewed preview token resets the draft cookies in the background', () => {
+  const RENEWED = `zpt_${'B'.repeat(43)}`
+  const ROUTE = '/api/zap-preview'
+
+  function spyFetch(result: Promise<Response> = Promise.resolve(new Response(null))) {
+    return vi.spyOn(window, 'fetch').mockImplementation(() => result)
+  }
+
+  it('a hello with a token other than the stored one goes through the draft route, once', () => {
+    sessionStorage.setItem(PREVIEW_TOKEN_STORAGE_KEY, TOKEN)
+    const fetch = spyFetch()
+    const { deliver } = boot({ draftRoute: ROUTE })
+    deliver(hello(SESSION, { previewToken: RENEWED }))
+    expect(fetch).toHaveBeenCalledTimes(1)
+    const [url, init] = fetch.mock.calls[0]!
+    expect(String(url).startsWith(`${ROUTE}?`)).toBe(true)
+    const query = new URL(String(url), location.href).searchParams
+    expect([...query.keys()]).toEqual(['token', 'path'])
+    expect(query.get('token')).toBe(RENEWED)
+    expect(query.get('path')).toBe(location.pathname)
+    expect(init).toEqual({ credentials: 'same-origin', redirect: 'manual' })
+    expect(sessionStorage.getItem(PREVIEW_TOKEN_STORAGE_KEY)).toBe(RENEWED)
+  })
+
+  it('a renewal within the same session (a second hello) does the same', () => {
+    const fetch = spyFetch()
+    const { deliver } = boot({ draftRoute: ROUTE })
+    deliver(hello())
+    expect(fetch).not.toHaveBeenCalled()
+    deliver(hello(SESSION, { previewToken: RENEWED }))
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(new URL(String(fetch.mock.calls[0]![0]), location.href).searchParams.get('token')).toBe(
+      RENEWED,
+    )
+  })
+
+  it.each([
+    ['the first token (nothing stored)', null, TOKEN, ROUTE],
+    ['the same token again', TOKEN, TOKEN, ROUTE],
+    ['a hello without a token', TOKEN, undefined, ROUTE],
+    ['no draft route', TOKEN, RENEWED, undefined],
+    ['a draft route that is not a plain path', TOKEN, RENEWED, 'https://evil.example/api'],
+  ])('no request for %s', (_name, stored, token, draftRoute) => {
+    if (stored) sessionStorage.setItem(PREVIEW_TOKEN_STORAGE_KEY, stored)
+    const fetch = spyFetch()
+    const { deliver, overlayMounted } = boot({ draftRoute })
+    deliver(hello(SESSION, { previewToken: token }))
+    expect(overlayMounted()).toBe(true)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('a failed request is swallowed: the page carries on with the new token', async () => {
+    sessionStorage.setItem(PREVIEW_TOKEN_STORAGE_KEY, TOKEN)
+    const failed = Promise.reject(new TypeError('Failed to fetch'))
+    const handled = vi.spyOn(failed, 'catch')
+    const fetch = spyFetch(failed)
+    const { deliver, title } = boot({ draftRoute: ROUTE })
+    deliver(hello(SESSION, { previewToken: RENEWED }))
+    expect(fetch).toHaveBeenCalledTimes(1)
+    // The rejection is handled where it is made, and settles quietly.
+    expect(handled).toHaveBeenCalledTimes(1)
+    await expect(handled.mock.results[0]!.value).resolves.toBeUndefined()
+    expect(sessionStorage.getItem(PREVIEW_TOKEN_STORAGE_KEY)).toBe(RENEWED)
+    deliver(values())
+    expect(title()).toBe('Borrador')
   })
 })
