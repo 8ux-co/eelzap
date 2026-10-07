@@ -621,7 +621,7 @@ const STYLES = `
 .chip {
   position: absolute; display: inline-flex; align-items: center; white-space: nowrap;
   font-family: Poppins, ui-sans-serif, system-ui, sans-serif; font-weight: 600; line-height: 1;
-  letter-spacing: 0; box-sizing: border-box;
+  letter-spacing: 0; text-transform: none; font-style: normal; box-sizing: border-box;
 }
 .of { font-weight: 400; opacity: .72; }
 .capture { position: fixed; inset: 0; pointer-events: auto; cursor: crosshair; display: none; }

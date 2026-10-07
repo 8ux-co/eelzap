@@ -50,6 +50,8 @@ export const ICONS = {
   alert: stroke('<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>'),
   field: stroke('<path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/>'),
   chevron: stroke('<path d="m6 9 6 6 6-6"/>'),
+  tick: stroke('<path d="M20 6 9 17l-5-5"/>'),
+  info: stroke('<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>'),
   /** Lucide `eye-off`, the suite's «Ocultar». */
   eyeOff: stroke(
     '<path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/><path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/><path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/><path d="m2 2 20 20"/>',
@@ -163,8 +165,35 @@ export const TOKENS = {
 const T = TOKENS
 const FONT = 'Poppins, ui-sans-serif, system-ui, sans-serif'
 
+/**
+ * A key cap («Enter», «Shift Z»), the ONE way the site tools draw a key.
+ * Mirrors `Kbd` in `packages/ui-web/src/kbd.tsx` (no React in a closed
+ * shadow root): 20px tall, at least 20px wide, 0 6px, 4px radius, a border,
+ * the background colour, muted 11px medium text, never selectable.
+ */
+export function kbd(doc: Document, ...keys: string[]): HTMLElement {
+  // Several keys pressed together are a group, as `KbdGroup` (2px apart).
+  return keys.length === 1
+    ? el(doc, 'kbd', { text: keys[0] })
+    : el(
+        doc,
+        'span',
+        { class: 'kbd-group' },
+        // A space between caps: invisible in the flex group, but the text
+        // (and a screen reader) reads «Shift Z», not «ShiftZ».
+        keys.flatMap((key, i) => [
+          ...(i ? [doc.createTextNode(' ')] : []),
+          el(doc, 'kbd', { text: key }),
+        ]),
+      )
+}
+
 const BASE_CSS = `
 :host { all: initial; }
+kbd { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; height: 20px; min-width: 20px;
+  padding: 0 6px; border: 1px solid ${T.border}; border-radius: 4px; background: ${T.bg}; color: ${T.muted};
+  font: 500 11px/12px ${FONT}; user-select: none; -webkit-user-select: none; pointer-events: none; }
+.kbd-group { display: inline-flex; align-items: center; gap: 2px; }
 * { box-sizing: border-box; }
 .layer { position: fixed; inset: 0; pointer-events: none; font-family: ${FONT}; color: ${T.fg};
   font-size: 13px; line-height: 1.45; -webkit-font-smoothing: antialiased; }

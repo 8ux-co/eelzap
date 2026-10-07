@@ -458,7 +458,7 @@ describe('the bar, mounted', () => {
   it('reduced motion: no transitions on the bar, no entrance animation', async () => {
     await ready()
     expect(css()).toContain(
-      '@media (prefers-reduced-motion: reduce) { .seg, .tool, .grip, .pill { transition: none; } [data-enter] { animation: none; } }',
+      '@media (prefers-reduced-motion: reduce) { .seg, .tool, .grip, .pill, .switch, .knob { transition: none; } [data-enter] { animation: none; } }',
     )
   })
 

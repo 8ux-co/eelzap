@@ -4,7 +4,7 @@
 // framing editor, the configured Zap, or production); the SRI hash pins the
 // bytes. apps/zap live-client.spec.ts checks it names a released file.
 
-export const PREVIEW_RELEASE_PATH = '/js/preview/preview.v1.d596b252d8afff70.js'
+export const PREVIEW_RELEASE_PATH = '/js/preview/preview.v1.702c7d7c0a8cbcdf.js'
 
 export const PREVIEW_RELEASE_INTEGRITY =
-  'sha384-LeIaGcZk+fQNnNJs65j+955Ez72VLAP5yuHd+J0vLqdkuJX9nQi4axLNf94zCoNX'
+  'sha384-MgY0PpmzRzbEMRNyUdmdJ7RkqIu/o9sSTAGuMxvh6Z7WkKGHVGVgchwOQ2HfwX90'

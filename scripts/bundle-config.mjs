@@ -79,8 +79,13 @@ export const BUDGETS = {
    * Raised from 25 KB to 27 KB (2026-10-06) for the draft-session exchange
    * (`draft-session.ts`) and the token lifecycle (`session.ts`: silent
    * renewal, retry on 401, the expired state). Measured 23909 → 26432.
+   * Raised to 29 KB (2026-10-07) for «Editar» per field type: native inputs
+   * for numbers, currency and dates, an ENUM list, a BOOLEAN switch, the
+   * reload after a value the site formats, and «Este campo se edita en Zap».
+   * Measured 26700 → 29278 (with the SitioEditar* boards: the key hint, the
+   * check on the current option, the field chip kept over an edited element).
    */
-  suggest: 27 * 1024,
+  suggest: 29 * 1024,
   /** Reserved, not built (§2.7 "Room for `./analytics`"). */
   analytics: 1024,
 }

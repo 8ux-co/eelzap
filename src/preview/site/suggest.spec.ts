@@ -324,20 +324,42 @@ describe('Editar (SitioEditar)', () => {
     const price = $('p[data-zap="blog/hola#price"]')
     click(price)
     expect(price.hasAttribute('contenteditable')).toBe(false)
+    expect(valueInput()!.type).toBe('number')
     expect(valueInput()!.value).toBe('12')
-    type(valueInput()!, '15,5')
+    // A native number input: its value is always dot-decimal, whatever the locale shows.
+    type(valueInput()!, '15.5')
     key('Enter', valueInput()!)
     await tick()
     expect(posts()[0]!.body.proposedValues).toEqual([{ fieldKey: 'price', value: 15.5 }])
   })
 
-  it('a field that is not text is not edited here: it says to comment instead', async () => {
+  it('a number the browser cannot parse is refused, never saved as a clear', async () => {
+    await ready()
+    tool('edit').click()
+    click($('p[data-zap="blog/hola#price"]'))
+    const input = valueInput()!
+    // What the browser reports for «15,5» where the decimal mark is a point.
+    Object.defineProperty(input, 'validity', { value: { badInput: true, valid: false } })
+    input.value = ''
+    key('Enter', input)
+    await tick()
+    // Nothing saved: the edit reverts and says the number is not valid.
+    expect(posts()).toEqual([])
+    expect($('p[data-zap="blog/hola#price"]').textContent).toBe('12')
+  })
+
+  it('rich text is not edited here: «Este campo se edita en Zap», quiet, not an error', async () => {
     await ready()
     tool('edit').click()
     click($('span[data-zap="blog/hola#published_at"]'))
     click($('div[data-zap="blog/hola#body"]'))
     expect($('div[data-zap="blog/hola#body"]').hasAttribute('contenteditable')).toBe(false)
-    expect(root().textContent).toContain('Esto no se edita aquí')
+    const card = root().querySelector('.card.info')!
+    expect(card.getAttribute('aria-label')).toBe('Este campo se edita en Zap')
+    expect(card.textContent).toContain('Este campo se edita en Zap')
+    expect(card.querySelector('[data-action="open-field"]')).not.toBeNull()
+    expect(card.querySelector('[data-action="comment-field"]')).not.toBeNull()
+    expect(root().textContent).not.toContain('Esto no se edita aquí')
     expect(posts()).toEqual([])
   })
 

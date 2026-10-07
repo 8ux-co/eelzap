@@ -693,3 +693,13 @@ describe('Overlay — spot mode and pins', () => {
     expect(overlay.inspect().capture).toBeNull()
   })
 })
+
+describe('the chip resets inherited type styles', () => {
+  it('the overlay stylesheet sets text-transform: none and font-style: normal on .chip', () => {
+    const { overlay } = setup(PAGE)
+    const css = (layerOf(overlay).getRootNode() as ShadowRoot).querySelector('style')!.textContent!
+    const rule = /(?:^|\n)\.chip \{([^}]*)\}/.exec(css)?.[1] ?? ''
+    expect(rule).toContain('text-transform: none')
+    expect(rule).toContain('font-style: normal')
+  })
+})

@@ -12,6 +12,7 @@ import {
   type FieldInfo,
   type OnPage,
   type OnPageComment,
+  type RawValue,
 } from './api'
 import type { ChunkHandle, SiteContext, StartOptions } from './config'
 import { barDrag, DRAG_CSS } from './drag'
@@ -20,6 +21,7 @@ import {
   inDraftSession,
   leaveDraftSession,
   requestDraftSession,
+  rememberEditIntent,
   takeEditIntent,
 } from './draft-session'
 import { SUGGEST_MESSAGES } from './messages'
@@ -31,9 +33,13 @@ import {
   editableText,
   editKindFor,
   fieldOf,
+  inputSpec,
+  parseInput,
   parseProposed,
   pinsFor,
+  proposableField,
   recordFor,
+  sameRaw,
   sameValue,
   spotAnchor,
   toApiAnchor,
@@ -42,7 +48,7 @@ import {
 } from './suggestion'
 import { createTokenSession, SESSION_MESSAGES } from './session'
 import { clearToken, readSession } from './token'
-import { el, icon, initials, mountHost, TOKENS as T, type IconName } from './ui'
+import { el, icon, initials, kbd, mountHost, TOKENS as T, type IconName } from './ui'
 
 /**
  * The `suggest` chunk: «Editar» and «Comentar» on the live site (zap-cms-v2
@@ -70,10 +76,17 @@ import { el, icon, initials, mountHost, TOKENS as T, type IconName } from './ui'
  * - **Editar** (only while the site's ADMIN leaves `liveEditing` on; off, the
  *   tool shows disabled with «Desactivado por un administrador»): the overlay
  *   outlines tagged fields; a click on a TEXT or LONG_TEXT field makes it
- *   editable in place, a NUMBER or URL field opens a small input. Leaving the
- *   field (or Enter) saves the new value straight to the record's draft
- *   through Zap's save path and says «Guardado en el borrador»; Escape puts it
- *   back. Nothing reaches the site's visitors until an ADMIN publishes in Zap.
+ *   editable in place; URL, NUMBER, INTEGER, CURRENCY (in major units),
+ *   DATE and DATETIME open a native input with the field's constraints, an
+ *   ENUM its options, a BOOLEAN a switch, each in a card beside the element
+ *   that takes focus and gives it back. Leaving the field, Enter or a pick
+ *   saves the new value straight to the record's draft through Zap's save
+ *   path and says «Guardado en el borrador»; Escape puts it back; the same
+ *   value saves nothing. A value the site formats itself reloads the page in
+ *   place after the save (`showSaved`). Rich text, media and any other type
+ *   say «Este campo se edita en Zap» with «Abrir en Zap» (the owning record,
+ *   at the field) and «Comentar». Nothing reaches the site's visitors until
+ *   an ADMIN publishes in Zap.
  * - **Comentar**: the overlay outlines any element and consumes the click; a
  *   click opens the composer anchored to that element, or to the point
  *   clicked when the element is most of the page. Shift, Cmd or Ctrl click
@@ -104,6 +117,8 @@ const PENDING_PIN = 'eelzap:pending'
 const LARGE_SHARE = 0.5
 
 const TOAST_MS = 8000
+/** «Guardado en el borrador» shows this long before a value the site formats reloads the page. */
+const RELOAD_AFTER_SAVE_MS = 700
 const SAVED_MS = 4000
 
 interface Composer {
@@ -138,6 +153,12 @@ interface Editing {
   pageUrl: string
   anchors: ApiAnchor[]
   before: string
+  /** ENUM, BOOLEAN, numbers and dates: the stored value the editor opened with. */
+  raw: RawValue | undefined
+  /** ENUM and BOOLEAN: what is picked now. */
+  picked: RawValue | undefined
+  /** Where focus goes back when the editor closes. */
+  returnFocus: Element | null
   /** Put the element back exactly as it was. */
   revert: () => void
   /** Stop editing, keeping what was typed. */
@@ -163,6 +184,13 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   // Editar asked for a draft session on this page and the tab came back in
   // draft mode: reopen Editar once the page read says it is allowed.
   let reopenEdit = takeEditIntent(win)
+  /**
+   * The flag says this tab is in a draft session, but the page came back
+   * untagged (the site's dev server restarted and its draft cookie no longer
+   * counts): the exchange runs again, once. Never on a load that an exchange
+   * (or a save) itself brought, so it cannot loop.
+   */
+  let retryDraft = !reopenEdit
 
   const host = mountHost(doc, CSS + DRAG_CSS)
   const layer = el(doc, 'div', { class: 'layer' })
@@ -185,6 +213,8 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   let editing: Editing | null = null
   let list: OnPageComment[] | null = null
   let toast: { title: string; body: string; error?: boolean } | null = null
+  /** «Este campo se edita en Zap» beside the field clicked in Editar, until closed. */
+  let info: { tagged: TaggedElement; card: HTMLElement } | null = null
   let toastTimer: number | null = null
   let status: 'saving' | 'saved' | 'preparing' | null = null
   let statusTimer: number | null = null
@@ -214,7 +244,12 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   // A press anywhere on the page closes the account menu. Presses inside the
   // shadow root reach the window as the host; the layer sorts those out.
   const onPressFirst = (event: PointerEvent) => {
-    if (menuOpen && event.target !== host.host) setMenu(false)
+    if (event.target === host.host) return
+    if (menuOpen) setMenu(false)
+    // A press on the page leaves an open editor (saved, as leaving a text
+    // field is) and closes «Este campo se edita en Zap».
+    if (editing?.card && !editing.done) commitEdit(editing)
+    if (info) closeInfo()
   }
   win.addEventListener('pointerdown', onPressFirst, true)
   layer.addEventListener('pointerdown', (event) => {
@@ -377,12 +412,14 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     // A page rendered outside draft mode carries no tags (no stega, empty
     // `attrs`): Editar first takes the tab through a draft session
     // (`draft-session.ts`), unless this tab is already in one.
-    if (next === 'edit' && !index.elements.length && !inDraftSession(win)) {
+    if (next === 'edit' && !index.elements.length && (retryDraft || !inDraftSession(win))) {
+      retryDraft = false
       void prepareEdit()
       return
     }
     endEdit()
     closeComposer()
+    closeInfo()
     mode = next
     selection = []
     overlay.clearSelection()
@@ -505,7 +542,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   function withTip(target: HTMLElement, text: string, end: boolean): HTMLElement {
     const show = () => {
       tip.replaceChildren(text)
-      if (key) tip.append(el(doc, 'span', { class: 'kbd', text: `Shift ${key}` }))
+      if (key) tip.append(kbd(doc, 'Shift', key))
       tip.classList.add('on')
       const rect = target.getBoundingClientRect()
       const vw = doc.documentElement.clientWidth || win.innerWidth
@@ -971,6 +1008,14 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
           box.style.top = `${rect.top - 3}px`
           box.style.width = `${rect.width + 6}px`
           box.style.height = `${rect.height + 6}px`
+          // The field's chip stays above an element edited in a card (SitioEditarOpcion).
+          if (editing?.card)
+            box.append(
+              el(doc, 'span', {
+                class: 'mark-chip',
+                text: editing.field.label || editing.tagged.fieldKey,
+              }),
+            )
           return box
         }),
     )
@@ -983,19 +1028,60 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       frame = null
       drawMarks()
       if (composer) position(composer.card, anchorRect(composer))
-      if (editing?.card) position(editing.card, editing.element.getBoundingClientRect())
+      if (editing?.card)
+        position(editing.card, editing.element.getBoundingClientRect(), editing.card.offsetWidth)
+      if (info) position(info.card, info.tagged.element.getBoundingClientRect(), 300)
     }) as number
   }
 
-  function position(card: HTMLElement, rect: Pick<DOMRect, 'left' | 'top' | 'bottom'>): void {
-    const width = Math.min(420, win.innerWidth - 16)
-    const height = card.offsetHeight || 260
-    const below = rect.bottom + 10
-    const top = below + height < win.innerHeight - 90 ? below : Math.max(8, rect.top - height - 10)
-    const left = Math.min(Math.max(8, rect.left), Math.max(8, win.innerWidth - width - 8))
+  /**
+   * Place a card (an editor, «Este campo se edita en Zap», the composer)
+   * beside what it is about: 10px under it, else over it, clear of the
+   * viewport's edges AND of the bar (or the pill) wherever it was dragged.
+   * Each side is tried as is, then shifted sideways past the bar; when none
+   * is clear, the first that fits the viewport wins.
+   */
+  function position(
+    card: HTMLElement,
+    rect: Pick<DOMRect, 'left' | 'top' | 'bottom'>,
+    preferred = 420,
+  ): void {
+    const vw = win.innerWidth
+    const vh = win.innerHeight
+    const width = Math.min(preferred, vw - 16)
+    // Measured at its final width: text wraps there.
     card.style.width = `${width}px`
-    card.style.top = `${top}px`
-    card.style.left = `${left}px`
+    const height = card.offsetHeight || 260
+    const bar = bottom.querySelector('.toolbar, .pill')?.getBoundingClientRect()
+    const clampX = (x: number) => Math.min(Math.max(8, x), Math.max(8, vw - width - 8))
+    const hits = (x: number, y: number) =>
+      !!bar &&
+      x < bar.right + 8 &&
+      x + width > bar.left - 8 &&
+      y < bar.bottom + 8 &&
+      y + height > bar.top - 8
+    const fits = (y: number) => y >= 8 && y + height <= vh - 8
+    let place: [number, number] | null = null
+    for (const y of [rect.bottom + 10, rect.top - height - 10]) {
+      if (!fits(y)) continue
+      for (const x of [
+        clampX(rect.left),
+        clampX((bar?.right ?? 0) + 8),
+        clampX((bar?.left ?? 0) - 8 - width),
+      ]) {
+        if (!hits(x, y)) {
+          place = [x, y]
+          break
+        }
+      }
+      if (place) break
+    }
+    if (!place) {
+      const y = fits(rect.bottom + 10) ? rect.bottom + 10 : Math.max(8, rect.top - height - 10)
+      place = [clampX(rect.left), y]
+    }
+    card.style.left = `${place[0]}px`
+    card.style.top = `${place[1]}px`
   }
 
   // ── Comentar ────────────────────────────────────────────────────────────
@@ -1056,7 +1142,7 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const own = single ? index.get(single) : null
     const tagged = own && own.recordRef === recordRef ? own : null
     const field = fieldOf(data, tagged)
-    const proposable = editKindFor(tagged, field) !== null
+    const proposable = proposableField(tagged, field)
     const target = single as HTMLElement | null
     const before =
       field?.type === 'URL' && target?.localName === 'a'
@@ -1362,9 +1448,11 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const field = fieldOf(data, tagged)
     const kind = editKindFor(tagged, field)
     if (!kind || !field) {
-      setToast({ title: m.notEditable, body: m.notEditableBody, error: true })
+      // Rich text, media and the rest: no editor on the page, a way there instead.
+      openInfoCard(tagged)
       return
     }
+    closeInfo()
     const element = tagged.element as HTMLElement
     const pageUrl = currentPageUrl(win)
     // The anchor BEFORE any edit: its text quote is what was published.
@@ -1373,6 +1461,13 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       field.type === 'URL' && element.localName === 'a'
         ? (element.getAttribute('href') ?? '')
         : normalizeText(element.textContent ?? '')
+    // The page shows these formatted («1.750 msnm», «Sí»): the editor opens on
+    // the stored value Zap sent; an older Zap sends none, and a NUMBER then
+    // reads the page's text as before.
+    const stored = data?.values?.[tagged.recordRef]?.[tagged.fieldKey]
+    const legacy =
+      field.type === 'NUMBER' && stored === undefined ? parseProposed('NUMBER', before) : null
+    const raw: RawValue | undefined = legacy?.ok ? legacy.value : stored
     const inline = kind === 'text' ? beginInlineEdit(element) : null
     const session: Editing = {
       element,
@@ -1383,6 +1478,9 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
       pageUrl,
       anchors,
       before,
+      raw,
+      picked: raw,
+      returnFocus: doc.activeElement,
       revert: inline?.revert ?? (() => {}),
       keep: inline?.keep ?? (() => {}),
       card: null,
@@ -1393,60 +1491,274 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     if (inline) {
       element.addEventListener('blur', () => commitEdit(session), { once: true })
       element.focus?.()
+    } else if (kind === 'choice') {
+      openChoiceCard(session)
+    } else if (kind === 'switch') {
+      openSwitchCard(session)
     } else {
       openInputCard(session)
     }
     renderBottom()
   }
 
-  /** NUMBER and URL: a small input beside the element; the page itself is not touched. */
+  /**
+   * The editor beside the element (SitioEditarOpcion, Numero, Fecha, SiNo):
+   * `body` and the key hint «Enter guarda · Esc cancela», 10px under the
+   * element so the field's chip stays above it, flipped above when there is
+   * no room. No buttons: Enter (or a pick) saves, Escape cancels, a press
+   * outside saves as leaving a text field does.
+   */
+  function openValueCard(
+    session: Editing,
+    body: HTMLElement,
+    focus: HTMLElement,
+    width: number,
+  ): void {
+    const label = session.field.label || session.tagged.fieldKey
+    const card = el(
+      doc,
+      'div',
+      {
+        class: 'card editor',
+        attrs: { role: 'dialog', 'aria-label': label },
+        on: {
+          keydown: (event) => {
+            const e = event as KeyboardEvent
+            // Enter saves from an input or the switch; an option's Enter picks it (a click).
+            if (e.key !== 'Enter' || (e.target as Element).getAttribute('role') === 'option') return
+            e.preventDefault()
+            commitEdit(session)
+          },
+        },
+      },
+      [
+        body,
+        el(doc, 'div', { class: 'keys' }, [
+          kbd(doc, 'Enter'),
+          m.enterSaves,
+          kbd(doc, 'Esc'),
+          m.escCancels,
+        ]),
+      ],
+    )
+    card.style.width = `${width}px`
+    session.card = card
+    layer.append(card)
+    position(card, session.element.getBoundingClientRect(), width)
+    focus.focus()
+  }
+
+  /** URL, numbers and dates: a native input with the field's constraints; the page is not touched. */
   function openInputCard(session: Editing): void {
+    const { field } = session
+    const spec =
+      field.type === 'URL'
+        ? { type: 'url', text: session.before, min: undefined, max: undefined, step: undefined }
+        : inputSpec(field, session.raw)
     const input = el(doc, 'input', {
       class: 'value',
       attrs: {
-        'aria-label': session.field.label || session.tagged.fieldKey,
-        type: 'text',
-        inputmode: session.field.type === 'NUMBER' ? 'decimal' : 'url',
+        'aria-label': field.label || session.tagged.fieldKey,
+        type: spec.type,
+        min: spec.min === undefined ? null : String(spec.min),
+        max: spec.max === undefined ? null : String(spec.max),
+        step: spec.step === undefined ? null : String(spec.step),
       },
     })
-    input.value = session.before
-    input.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
-        event.preventDefault()
-        commitEdit(session)
-      }
-    })
-    const card = el(doc, 'div', { class: 'card popover sheet', attrs: { role: 'dialog' } }, [
-      el(doc, 'div', { class: 'head' }, [
-        el(doc, 'span', { class: 'chip' }, [
-          icon(doc, 'field', 12),
-          session.field.label || session.tagged.fieldKey,
-        ]),
-        closeButton(m.close, () => cancelEdit(session)),
-      ]),
-      el(doc, 'div', { class: 'content' }, [
-        input,
-        el(doc, 'div', { class: 'actions' }, [
-          el(doc, 'button', {
-            class: 'btn btn-outline',
-            text: m.cancel,
-            attrs: { type: 'button' },
-            on: { click: () => cancelEdit(session) },
-          }),
-          el(doc, 'button', {
-            class: 'btn btn-primary',
-            text: m.save,
-            attrs: { type: 'button', 'data-action': 'save' },
-            on: { click: () => commitEdit(session) },
-          }),
-        ]),
-      ]),
-    ])
-    session.card = card
+    input.value = spec.text
     session.input = input
+    const unit = field.type === 'CURRENCY' ? (field.currency ?? null) : null
+    openValueCard(
+      session,
+      unit
+        ? el(doc, 'div', { class: 'with-unit' }, [
+            input,
+            el(doc, 'span', { class: 'muted', text: unit }),
+          ])
+        : input,
+      input,
+      field.type === 'URL' ? 280 : 220,
+    )
+  }
+
+  /** ENUM: its options, a check on the current one; a pick saves at once (arrows move). */
+  function openChoiceCard(session: Editing): void {
+    const buttons = (session.field.options ?? []).map((option) =>
+      el(
+        doc,
+        'button',
+        {
+          class: 'option',
+          attrs: {
+            type: 'button',
+            role: 'option',
+            'aria-selected': String(option.id === session.raw),
+            tabindex: '-1',
+          },
+          on: {
+            click: () => {
+              session.picked = option.id
+              commitEdit(session)
+            },
+          },
+        },
+        [
+          el(doc, 'span', { class: 'option-label', text: option.label }),
+          option.id === session.raw ? icon(doc, 'tick', 14) : null,
+        ],
+      ),
+    )
+    const first =
+      buttons.find((button) => button.getAttribute('aria-selected') === 'true') ?? buttons[0]!
+    first.tabIndex = 0
+    const list = el(
+      doc,
+      'div',
+      {
+        class: 'options',
+        attrs: { role: 'listbox', 'aria-label': m.options(session.field.label) },
+        on: {
+          keydown: (event) => {
+            const e = event as KeyboardEvent
+            const at = buttons.indexOf(host.root.activeElement as HTMLButtonElement)
+            const to = (
+              { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: buttons.length - 1 } as Record<
+                string,
+                number
+              >
+            )[e.key]
+            if (to === undefined) return
+            e.preventDefault()
+            buttons[Math.min(buttons.length - 1, Math.max(0, to))]?.focus()
+          },
+        },
+      },
+      buttons,
+    )
+    openValueCard(session, list, first, 230)
+  }
+
+  /** BOOLEAN: the field's name and a switch (Space or a click flips it); Enter saves. */
+  function openSwitchCard(session: Editing): void {
+    session.picked = session.raw === true
+    const label = session.field.label || session.tagged.fieldKey
+    const toggle = el(
+      doc,
+      'button',
+      {
+        class: 'switch',
+        attrs: {
+          type: 'button',
+          role: 'switch',
+          'aria-checked': String(session.picked),
+          'aria-label': label,
+        },
+        on: {
+          click: () => {
+            session.picked = !session.picked
+            toggle.setAttribute('aria-checked', String(session.picked))
+          },
+        },
+      },
+      [el(doc, 'span', { class: 'knob' })],
+    )
+    openValueCard(
+      session,
+      el(doc, 'div', { class: 'switch-row' }, [
+        el(doc, 'span', { class: 'title', text: label }),
+        toggle,
+      ]),
+      toggle,
+      220,
+    )
+  }
+
+  /**
+   * «Este campo se edita en Zap» (SitioEditarEnZap): rich text, media and any
+   * other type, beside the element, with the field named and two ways on:
+   * its record's editor in Zap at this field, or Comentar on the element.
+   * Quiet, not an error.
+   */
+  function openInfoCard(tagged: TaggedElement): void {
+    closeInfo()
+    const field = fieldOf(data, tagged)
+    const label = field?.label || tagged.fieldKey
+    const card = el(
+      doc,
+      'div',
+      { class: 'card info', attrs: { role: 'dialog', 'aria-label': m.editInZap } },
+      [
+        icon(doc, 'info', 16),
+        el(doc, 'div', { class: 'toast-text' }, [
+          el(doc, 'span', { class: 'title', text: m.editInZap }),
+          el(doc, 'span', {
+            class: 'muted',
+            text: m.editInZapBody(label, field?.type ?? '', tagged.recordRef.startsWith('doc:')),
+          }),
+          el(doc, 'div', { class: 'actions start' }, [
+            el(
+              doc,
+              'button',
+              {
+                class: 'btn btn-outline',
+                attrs: { type: 'button', 'data-action': 'open-field' },
+                on: {
+                  click: () => {
+                    closeInfo()
+                    win.open(fieldEditorUrl(tagged), '_blank', 'noopener')
+                  },
+                },
+              },
+              [icon(doc, 'external', 14), m.openInZap],
+            ),
+            el(
+              doc,
+              'button',
+              {
+                class: 'btn btn-ghost',
+                attrs: { type: 'button', 'data-action': 'comment-field' },
+                on: {
+                  click: () => {
+                    closeInfo()
+                    setMode('comment')
+                    if (mode === 'comment') openComposer([tagged.element], null)
+                  },
+                },
+              },
+              [icon(doc, 'commentPlus', 14), m.comment],
+            ),
+          ]),
+        ]),
+      ],
+    )
+    info = { tagged, card }
     layer.append(card)
-    position(card, session.element.getBoundingClientRect())
-    input.focus()
+    position(card, tagged.element.getBoundingClientRect(), 300)
+  }
+
+  function closeInfo(): void {
+    info?.card.remove()
+    info = null
+  }
+
+  /**
+   * The editor of the record that OWNS the field, at that field (`?field=`,
+   * Zap's locate): `editorUrls` by ref; an older Zap sends only the page's
+   * own record, used when the field is that record's; else Zap's home.
+   */
+  function fieldEditorUrl(tagged: TaggedElement): string {
+    const own = !data?.records?.[tagged.recordRef]
+    const base =
+      data?.editorUrls?.[tagged.recordRef] ?? (own ? data?.viewer?.editorUrl : null) ?? null
+    const safe = zapUrl(base, ctx.zapOrigin)
+    if (!base) return safe
+    try {
+      const url = new URL(safe)
+      url.searchParams.set('field', tagged.fieldKey)
+      return url.href
+    } catch {
+      return safe
+    }
   }
 
   /** Make the element editable in place; how to put it back, or keep what was typed. */
@@ -1489,6 +1801,9 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     session.card?.remove()
     if (editing === session) editing = null
     renderBottom()
+    // Focus goes back where it was before the editor opened.
+    const back = session.returnFocus as HTMLElement | null
+    if (session.card && back?.isConnected) back.focus?.({ preventScroll: true })
   }
 
   function cancelEdit(session: Editing): void {
@@ -1496,37 +1811,67 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     finishEdit(session, false)
   }
 
-  /** Save what was typed to the draft, or put the element back when nothing changed. */
+  /** Save what was typed or picked to the draft, or put the element back when nothing changed. */
   function commitEdit(session: Editing): void {
     if (session.done) return
-    const parsed = parseProposed(session.field.type, typedValue(session))
-    if (!parsed.ok) {
-      finishEdit(session, false)
-      setToast({ title: m.saveFailed, body: m.invalidNumber, error: true })
-      return
+    const { field, kind } = session
+    // Text and URL compare with what the page showed; the other types with
+    // the stored value Zap sent (`sameRaw`).
+    const text = kind === 'text' || field.type === 'URL'
+    let value: RawValue
+    if (text) {
+      const parsed = parseProposed(field.type, typedValue(session))
+      const before = parseProposed(field.type, session.before)
+      if (parsed.ok && before.ok && sameValue(before.value, parsed.value)) {
+        finishEdit(session, false)
+        return
+      }
+      if (!parsed.ok) return invalid(session)
+      value = parsed.value
+    } else if (kind === 'input') {
+      // A native number or date input the browser cannot parse ("15,5" where
+      // the decimal mark is a point) reports an empty value: that is not a
+      // clear, so never save it as one.
+      if (session.input?.validity?.badInput) return invalid(session)
+      const parsed = parseInput(field, typedValue(session))
+      if (!parsed.ok) return invalid(session)
+      value = parsed.value
+    } else {
+      value = session.picked ?? null
     }
     // Nothing changed (stega markers and whitespace aside): put the element
     // back and write nothing, no thread and no draft.
-    const before = parseProposed(session.field.type, session.before)
-    if (before.ok && sameValue(before.value, parsed.value)) {
+    if (!text && sameRaw(field.type, session.raw, value)) {
       finishEdit(session, false)
       return
     }
     finishEdit(session, true)
-    void save(session, {
-      fieldKey: session.tagged.fieldKey,
-      locale: session.tagged.locale,
-      value: parsed.value,
-    })
+    void save(
+      session,
+      { fieldKey: session.tagged.fieldKey, locale: session.tagged.locale, value },
+      kind === 'choice'
+        ? field.options?.find((option) => option.id === value)?.label
+        : kind === 'switch'
+          ? value
+            ? m.yes
+            : m.no
+          : undefined,
+    )
   }
 
-  async function save(session: Editing, proposal: Proposal): Promise<void> {
+  function invalid(session: Editing): void {
+    finishEdit(session, false)
+    setToast({ title: m.saveFailed, body: m.invalidNumber, error: true })
+  }
+
+  async function save(session: Editing, proposal: Proposal, display?: string): Promise<void> {
     setStatus('saving')
     const body = buildDraftBody({
       recordRef: session.recordRef,
       pageUrl: session.pageUrl,
       anchors: session.anchors,
       proposal,
+      display,
     })
     // One key for the retry after a renewal too: a 401 wrote nothing, and the
     // same key keeps a doubled answer from saving twice.
@@ -1534,13 +1879,49 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     const result = await auth.call((token) => saveToDraft(ctx, token, body, draftKey))
     if (destroyed) return
     if (!result.ok) {
+      setStatus(null)
+      // Zap already holds that value: nothing to save and nothing to undo.
+      if (result.kind === 'unchanged') return
       // The page goes back to what is published; nothing was saved.
       session.revert()
-      setStatus(null)
       onFailure(result, 'edit')
       return
     }
     setStatus('saved')
+    // The next editor on this field opens on what was just saved, not on the
+    // page read's value (the page may not reload: an ENUM label in place).
+    if (data && session.raw !== undefined)
+      (data.values ??= {})[session.recordRef] = {
+        ...data.values[session.recordRef],
+        [session.tagged.fieldKey]: proposal.value,
+      }
+    showSaved(session, display)
+  }
+
+  /**
+   * After a save the page shows the new value. Text is already there (typed
+   * in place) and a URL lands in the link's `href` at the next read; an
+   * ENUM's label is written into an element tagged by attribute that holds
+   * only text. Everything the site formats itself (numbers, dates, a
+   * currency, a yes or no, an ENUM inside markup or found by stega) needs the
+   * page to render again: it reloads in place (the browser keeps the scroll,
+   * the draft session keeps it on the draft) and Editar reopens.
+   * The editor preview's rule (`needsRefresh` in Zap).
+   */
+  function showSaved(session: Editing, display: string | undefined): void {
+    const { field, tagged, element } = session
+    if (session.kind === 'text' || field.type === 'URL') return
+    if (
+      field.type === 'ENUM' &&
+      display !== undefined &&
+      tagged.source === 'attr' &&
+      element.children.length === 0
+    ) {
+      element.textContent = display
+      return
+    }
+    rememberEditIntent(win)
+    win.setTimeout(() => win.location.reload(), RELOAD_AFTER_SAVE_MS)
   }
 
   function endEdit(): void {
@@ -1564,6 +1945,11 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
     if (composer && event.key === 'Escape') {
       event.preventDefault()
       closeComposer()
+      return
+    }
+    if (info && event.key === 'Escape') {
+      event.preventDefault()
+      closeInfo()
       return
     }
     const session = editing
@@ -1698,11 +2084,9 @@ const CSS = `
   border-radius: 7px; background: #101828; color: #FFFFFF; font-weight: 500; font-size: 12px; line-height: 18px;
   white-space: nowrap; pointer-events: none; }
 .tip:not(.on) { display: none; }
-.kbd { font-size: 11px; line-height: 16px; color: #CBD5E1; padding: 1px 5px; border-radius: 4px;
-  background: rgba(255,255,255,.12); }
 [data-enter] { animation: eelzap-in .16s cubic-bezier(.4,0,.2,1); }
 @keyframes eelzap-in { from { opacity: 0; transform: scale(.96); } }
-@media (prefers-reduced-motion: reduce) { .seg, .tool, .grip, .pill { transition: none; } [data-enter] { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .seg, .tool, .grip, .pill, .switch, .knob { transition: none; } [data-enter] { animation: none; } }
 .tool.strong { color: ${T.fg}; }
 .divider { width: 1px; height: 22px; background: ${T.border}; }
 .avatar { width: 26px; height: 26px; border-radius: 7px; background: #DBEAFE; color: #1D4ED8;
@@ -1726,7 +2110,35 @@ const CSS = `
 .refused { align-self: center; margin-right: 0; width: min(420px, calc(100vw - 16px)); align-items: flex-start; }
 .toast > .icon { color: #16A34A; }
 .refused > .icon, .toast-error > .icon { color: ${T.danger}; }
-.paused > .icon { color: ${T.muted}; }
+.paused > .icon, .info > .icon { color: ${T.muted}; }
+.editor { min-width: max-content; }
+.editor, .info { position: fixed; padding: 8px; border-radius: 7px;
+  box-shadow: 0 4px 6px -1px rgba(15,23,42,.08), 0 2px 4px -2px rgba(15,23,42,.06); }
+.info { display: flex; gap: 10px; padding: 12px 14px; }
+.info > .icon { margin-top: 1px; }
+.info .title { font-weight: 500; }
+.info .muted { font-size: 12px; }
+.actions.start { justify-content: flex-start; margin-top: 10px; gap: 6px; }
+.actions.start .btn { height: 28px; gap: 7px; font-size: 12px; }
+.btn-ghost { border: 1px solid transparent; }
+.btn-ghost:hover { background: ${T.subtle}; }
+.keys { display: flex; align-items: center; gap: 5px; margin: 8px 2px 0; font-size: 12px; color: ${T.muted}; white-space: nowrap; }
+.editor input.value { height: 34px; border-radius: 8px; }
+.with-unit { display: flex; align-items: center; gap: 8px; }
+.options { display: flex; flex-direction: column; max-height: 260px; overflow: auto; }
+.option { width: 100%; height: 32px; gap: 8px; padding: 0 8px; border-radius: 6px; font-weight: 400; text-align: left; }
+.option:hover, .option:focus-visible { background: #F1F5F9; box-shadow: none; }
+.option-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.switch-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 2px 2px 0; }
+.switch-row .title { font-weight: 500; }
+.switch { position: relative; width: 32px; height: 18px; border-radius: 999px; background: #CBD5E1; transition: background .15s; }
+.switch[aria-checked="true"] { background: ${T.primary}; }
+.knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 999px; background: ${T.bg};
+  box-shadow: 0 1px 2px rgba(0,0,0,.15); transition: left .15s; }
+.switch[aria-checked="true"] .knob { left: 16px; }
+.mark-chip { position: absolute; right: -5px; top: -27px; display: inline-flex; align-items: center; height: 20px;
+  padding: 0 7px; border-radius: 6px; background: ${T.gold}; color: #FFFFFF; font: 600 12px Poppins, ui-sans-serif, system-ui, sans-serif;
+  white-space: nowrap; }
 .toast-text { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
 .title { font-weight: 600; }
 .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

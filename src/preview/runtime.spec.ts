@@ -332,6 +332,14 @@ describe('page runtime', () => {
     expect(posted().filter((m) => m.type === 'zap:ready')).toHaveLength(2)
   })
 
+  it('destroy cancels the pending ready retries: nothing is said after it', () => {
+    vi.useFakeTimers()
+    const { posted, runtime } = boot(PAGE)
+    runtime.destroy()
+    vi.advanceTimersByTime(60_000)
+    expect(posted().filter((m) => m.type === 'zap:ready')).toHaveLength(1)
+  })
+
   it('a page restored from the back-forward cache says ready again; a fresh pageshow does not', () => {
     const { posted, hello } = boot(PAGE)
     hello()

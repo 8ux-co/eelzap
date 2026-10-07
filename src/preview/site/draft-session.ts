@@ -120,6 +120,11 @@ export function inDraftSession(win: Window, now = Date.now()): boolean {
   )
 }
 
+/** Reopen Editar after this page reloads (a saved value the site formats itself). */
+export function rememberEditIntent(win: Window, now = Date.now()): void {
+  write(win, EDIT_INTENT_KEY, { path: win.location.pathname, at: now })
+}
+
 /**
  * Whether Editar should reopen now: an intent left on this very path in the
  * last two minutes. Read once: the intent is removed either way.

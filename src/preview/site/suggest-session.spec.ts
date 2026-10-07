@@ -268,7 +268,7 @@ describe('item 13: Editar on the live site through a draft session', () => {
     expect(tool('edit').getAttribute('aria-pressed')).toBe('false')
   })
 
-  it('already in this tab’s draft session and still untagged: the page has no fields, no second exchange', async () => {
+  it('already in this tab’s draft session and still untagged: the exchange runs again, once', async () => {
     document.body.innerHTML = PUBLISHED
     sessionStorage.setItem(
       DRAFT_SESSION_KEY,
@@ -278,8 +278,47 @@ describe('item 13: Editar on the live site through a draft session', () => {
     await ready()
     tool('edit').click()
     await tick()
+    expect(sessionPosts()).toHaveLength(1)
+    expect(assign).toHaveBeenCalledTimes(1)
+    expect(new URL(assign.mock.calls[0]![0] as string).pathname).toBe(ROUTE)
+  })
+
+  it('the one retry is per page load: a second Editar on the same load is the empty state, no second exchange', async () => {
+    document.body.innerHTML = PUBLISHED
+    sessionStorage.setItem(
+      DRAFT_SESSION_KEY,
+      JSON.stringify({ exp: Date.now() + 600_000, origin: window.location.origin }),
+    )
+    mockLocation()
+    routes.session = () => json({ error: { code: 'FORBIDDEN' } }, 403)
+    await ready()
+    tool('edit').click()
+    await tick()
+    expect(sessionPosts()).toHaveLength(1)
+    expect(root().textContent).toContain('No pudimos preparar la página para editar')
+
+    tool('edit').click()
+    await tick()
+    expect(root().textContent).toContain('No hay campos para editar aquí')
+    expect(sessionPosts()).toHaveLength(1)
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  it('a load the exchange itself brought, still untagged: the empty state, no retry (no loop)', async () => {
+    document.body.innerHTML = PUBLISHED
+    sessionStorage.setItem(
+      DRAFT_SESSION_KEY,
+      JSON.stringify({ exp: Date.now() + 600_000, origin: window.location.origin }),
+    )
+    sessionStorage.setItem(EDIT_INTENT_KEY, JSON.stringify({ path: '/blog/hola', at: Date.now() }))
+    mockLocation()
+    await ready()
+    await tick()
+    tool('edit').click()
+    await tick()
     expect(root().textContent).toContain('No hay campos para editar aquí')
     expect(sessionPosts()).toHaveLength(0)
+    expect(assign).not.toHaveBeenCalled()
   })
 
   it('back from the draft route, tagged, with the intent: Editar is on by itself', async () => {

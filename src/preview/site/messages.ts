@@ -99,8 +99,29 @@ export const SUGGEST_MESSAGES = {
       }. La página no cambia hasta que se publique.`,
     saving: 'Guardando',
     saved: 'Guardado en el borrador',
-    notEditable: 'Esto no se edita aquí',
-    notEditableBody: 'Usa Comentar para pedir el cambio.',
+    editInZap: 'Este campo se edita en Zap',
+    /**
+     * The field named, what it is, and where it changes («Historia es texto
+     * con formato. Cámbialo en el editor de la entrada.»).
+     */
+    editInZapBody: (label: string, type: string, document: boolean) => {
+      const where = `en el editor ${document ? 'del documento' : 'de la entrada'}`
+      const kind = (
+        {
+          IMAGE: ['una imagen', 'Cámbiala'],
+          GALLERY: ['una galería', 'Cámbiala'],
+          RICH_TEXT: ['texto con formato', 'Cámbialo'],
+          VIDEO: ['un video', 'Cámbialo'],
+          FILE: ['un archivo', 'Cámbialo'],
+        } as Record<string, [string, string]>
+      )[type]
+      return kind ? `${label} es ${kind[0]}. ${kind[1]} ${where}.` : `${label} se cambia ${where}.`
+    },
+    enterSaves: 'guarda',
+    escCancels: 'cancela',
+    yes: 'Sí',
+    no: 'No',
+    options: (label: string) => `Opciones de ${label}`,
     inRecord: (name: string) => `en ${name}`,
     noFields: 'No hay campos para editar aquí',
     noFieldsBody:
@@ -176,8 +197,25 @@ export const SUGGEST_MESSAGES = {
       }. The page does not change until it is published.`,
     saving: 'Saving',
     saved: 'Saved to the draft',
-    notEditable: 'This is not edited here',
-    notEditableBody: 'Use Comment to ask for the change.',
+    editInZap: 'This field is edited in Zap',
+    editInZapBody: (label: string, type: string, document: boolean) => {
+      const where = `in the ${document ? "document's" : "entry's"} editor`
+      const kind = (
+        {
+          IMAGE: 'an image',
+          GALLERY: 'a gallery',
+          RICH_TEXT: 'formatted text',
+          VIDEO: 'a video',
+          FILE: 'a file',
+        } as Record<string, string>
+      )[type]
+      return kind ? `${label} is ${kind}. Change it ${where}.` : `${label} is changed ${where}.`
+    },
+    enterSaves: 'saves',
+    escCancels: 'cancels',
+    yes: 'Yes',
+    no: 'No',
+    options: (label: string) => `${label} options`,
     inRecord: (name: string) => `in ${name}`,
     noFields: 'Nothing to edit here',
     noFieldsBody:

@@ -19,7 +19,7 @@ import {
   type PendingSignIn,
 } from './oauth'
 import { writeToken } from './token'
-import { el, icon, mountHost, TOKENS as T } from './ui'
+import { el, icon, kbd, mountHost, TOKENS as T } from './ui'
 
 /**
  * The `signin` chunk (zap-cms-v2 §3.4 steps 2 to 5, ADR 041; boards
@@ -88,12 +88,9 @@ export function start(ctx: SiteContext, options: StartOptions = {}): ChunkHandle
   function hint(): HTMLElement | string {
     const key = ctx.shortcut
     if (!key) return ''
-    const kbd = (text: string) => el(doc, 'kbd', { text })
     return el(doc, 'span', { class: 'hint', attrs: { role: 'tooltip' } }, [
       `${m.hintBefore} `,
-      kbd('Shift'),
-      ' ',
-      kbd(key.toUpperCase()),
+      kbd(doc, 'Shift', key.toUpperCase()),
       ` ${m.hintAfter}`,
     ])
   }
@@ -240,8 +237,6 @@ const CSS = `
   box-shadow: 0 10px 15px -3px rgba(15,23,42,.10), 0 4px 6px -4px rgba(15,23,42,.08); }
 .hint { pointer-events: none; position: fixed; left: 50%; transform: translateX(-50%); bottom: 76px; display: flex; align-items: center; gap: 4px;
   padding: 6px 10px; border-radius: 9px; background: ${T.dark}; color: #FFFFFF; font-size: 12px; white-space: nowrap; }
-kbd { font: 600 11px Poppins, ui-sans-serif, system-ui, sans-serif; padding: 1px 5px; border-radius: 5px;
-  background: rgba(255,255,255,.16); color: #FFFFFF; }
 .launcher[aria-expanded="true"] { box-shadow: 0 10px 15px -3px rgba(15,23,42,.10), 0 0 0 3px ${T.focus}; }
 .panel { left: calc(50% - 160px); bottom: 78px; width: 320px; padding: 16px; }
 .head { display: flex; align-items: center; justify-content: space-between; }

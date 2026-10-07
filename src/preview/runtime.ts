@@ -246,6 +246,7 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
   }
   /** Whether a hello arrived: until then, `zap:ready` is said again. */
   let greeted = false
+  const retries: number[] = []
   function announce(): void {
     log('ready', config.pageUrl())
     bridge.post('zap:ready', {
@@ -275,7 +276,8 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     report('ready', true)
     // An editor whose listener mounted after this ready (a soft navigation in
     // Zap) never answers it: say it again until a hello comes.
-    for (const ms of [500, 1500, 4000]) win.setTimeout(() => greeted || announce(), ms)
+    for (const ms of [500, 1500, 4000])
+      retries.push(win.setTimeout(() => greeted || announce(), ms))
   }
 
   if (doc.readyState === 'loading') {
@@ -290,6 +292,7 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     overlay,
     refresh,
     destroy() {
+      for (const id of retries) win.clearTimeout(id)
       stopObserving()
       win.removeEventListener('pagehide', onPageHide)
       win.removeEventListener('pageshow', onPageShow)

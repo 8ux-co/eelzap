@@ -5,7 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.1] - Unreleased
+## [0.10.2] - Unreleased
+
+### Added
+
+- Live-site «Editar» edits every simple field type on the page: options (ENUM), numbers, integers and amounts, dates and date-times, and yes/no. Each opens a small editor under the element; Enter saves, Esc cancels.
+- Fields edited only in Zap (rich text, images, galleries, video, files) show «Este campo se edita en Zap» with «Abrir en Zap» at that field and «Comentar».
+
+### Changed
+
+- Editors and cards keep clear of the bar wherever it sits; key caps match the suite's `Kbd`.
+- A tab whose draft session was lost re-enters it once before reporting no editable fields.
+
+### Fixed
+
+- Amounts use ISO 4217 minor units (COP in hundredths), not the locale's display digits.
+
+## [0.10.1] - 2026-10-07
 
 ### Added
 

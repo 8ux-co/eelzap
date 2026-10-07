@@ -1,6 +1,6 @@
 {
   "name": "@8ux-co/eelzap",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "The Eel Zap client: typed content delivery and writes, stega-aware field helpers, Next.js and React preview helpers, and the on-demand preview overlay.",
   "license": "MIT",
   "repository": {

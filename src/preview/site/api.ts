@@ -15,6 +15,7 @@ import type { SiteContext } from './config'
  * - `forbidden` (a readable 403: no Zap seat, or «Editar» turned off for this
  *   site on the save-to-draft route).
  * - `rate` (429) with `Retry-After` seconds.
+ * - `unchanged` (409 `NO_CHANGE`): «Editar» saved what the draft already holds.
  * - `invalid` for anything else.
  *
  * Creates are idempotent: the caller passes the `Idempotency-Key`, kept for
@@ -23,7 +24,7 @@ import type { SiteContext } from './config'
  */
 
 export type ApiFailure =
-  | { ok: false; kind: 'expired' | 'refused' | 'forbidden' | 'invalid' }
+  | { ok: false; kind: 'expired' | 'refused' | 'forbidden' | 'invalid' | 'unchanged' }
   | { ok: false; kind: 'rate'; retryAfter: number }
 
 export type ApiResult<T> = { ok: true; data: T } | ApiFailure
@@ -31,7 +32,22 @@ export type ApiResult<T> = { ok: true; data: T } | ApiFailure
 export interface FieldInfo {
   type: string
   label: string
+  /** ENUM: the options in order, by id (what a save sends) and label (what shows). */
+  options?: Array<{ id: string; label: string }>
+  /** NUMBER, INTEGER, CURRENCY: the field's constraints, when it has them. */
+  min?: number
+  max?: number
+  step?: number
+  /** CURRENCY: the ISO 4217 code a value is in (its amount travels in minor units). */
+  currency?: string
 }
+
+/**
+ * A field's value as «Editar» reads and saves it beside text: an ENUM's
+ * option id, a number (CURRENCY in minor units), `YYYY-MM-DD` for a DATE, an
+ * ISO string for a DATETIME, a boolean, or null when empty.
+ */
+export type RawValue = string | number | boolean | null
 
 export interface OnPageAnchor {
   fieldKey: string | null
@@ -67,6 +83,15 @@ export interface OnPage {
    * Zaps omit it).
    */
   records?: Record<string, string>
+  /**
+   * The current value (the draft's, else the published one) of each ENUM,
+   * NUMBER, INTEGER, CURRENCY, DATE, DATETIME and BOOLEAN field of the tagged
+   * records, by ref and field key: what «Editar» opens with, since the page
+   * shows them formatted (optional: older Zaps omit it). Never text.
+   */
+  values?: Record<string, Record<string, RawValue>>
+  /** Each tagged record's editor in Zap, by ref, for «Abrir en Zap» on its fields. */
+  editorUrls?: Record<string, string>
   comments: OnPageComment[]
   truncated: boolean
 }
@@ -96,7 +121,7 @@ export interface CreateBody {
   pageUrl: string
   anchors: ApiAnchor[]
   body: string
-  proposedValues?: Array<{ fieldKey: string; locale?: string; value: string | number | null }>
+  proposedValues?: Array<{ fieldKey: string; locale?: string; value: RawValue }>
 }
 
 /** «Editar» saves to the draft: always a resolved change request, so no flag. */
@@ -129,6 +154,12 @@ async function call<T>(
   if (response.status === 429) {
     const seconds = Number.parseInt(response.headers.get('Retry-After') ?? '', 10)
     return { ok: false, kind: 'rate', retryAfter: seconds > 0 ? Math.min(seconds, 3600) : 30 }
+  }
+  // 409 NO_CHANGE: the value already is the stored one (save-to-draft); any
+  // other 409 (a duplicate of a unique value) is a failure.
+  if (response.status === 409) {
+    const body = (await response.json().catch(() => null)) as { error?: { code?: unknown } } | null
+    if (body?.error?.code === 'NO_CHANGE') return { ok: false, kind: 'unchanged' }
   }
   if (!response.ok) return { ok: false, kind: 'invalid' }
   try {
