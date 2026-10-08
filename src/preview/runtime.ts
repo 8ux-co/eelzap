@@ -4,10 +4,12 @@ import { createPageBridge, type MessageTargetLike, type PageBridge } from './pag
 import {
   CAPABILITIES,
   PAGE_UNLOAD_ERROR,
+  type DiffMark,
   type EditorMessage,
   type PausedPayload,
   type TagSummary,
 } from './protocol'
+import { createScrollSync } from './scroll'
 import { observeTags, TagIndex, tagGuard, type TagProblem } from './tags'
 import { ValueApplier } from './values'
 
@@ -17,7 +19,7 @@ import { ValueApplier } from './values'
  * Zap's editor by its real URL (§2.7).
  */
 
-export const CLIENT_VERSION = '0.10.0'
+export const CLIENT_VERSION = '0.11.0'
 
 export interface RuntimeOptions {
   win?: Window
@@ -125,6 +127,18 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     },
   })
 
+  const scroll = createScrollSync(win, doc, index, (payload) => bridge.post('zap:scroll', payload))
+  /** Comparar's marks, by field: re-resolved to elements after every rescan. */
+  let marks: DiffMark[] = []
+  const drawMarks = () =>
+    overlay.setMarks(
+      marks.flatMap(({ recordRef, fieldKey, tone, label, active }) =>
+        index
+          .byField(recordRef, fieldKey)
+          .map(({ element }) => ({ element, tone, label, active: !!active })),
+      ),
+    )
+
   function handle(message: EditorMessage): void {
     switch (message.type) {
       case 'zap:hello': {
@@ -178,6 +192,16 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
         overlay.setPins(pins)
         return
       }
+      case 'zap:scroll-sync':
+        scroll.setEnabled(message.payload.enabled)
+        return
+      case 'zap:scroll-to':
+        scroll.scrollTo(message.payload)
+        return
+      case 'zap:marks':
+        marks = message.payload.marks
+        drawMarks()
+        return
     }
   }
 
@@ -222,6 +246,7 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
   function refresh(page = true): void {
     if (!scan(page)) return
     values.reapply()
+    if (marks.length) drawMarks()
     report(page ? 'mutation' : 'reapply')
     const url = config.pageUrl()
     if (url !== lastUrl) {
@@ -294,6 +319,7 @@ export function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}
     destroy() {
       for (const id of retries) win.clearTimeout(id)
       stopObserving()
+      scroll.destroy()
       win.removeEventListener('pagehide', onPageHide)
       win.removeEventListener('pageshow', onPageShow)
       overlay.destroy()

@@ -28,7 +28,7 @@ let fetchMock: ReturnType<typeof vi.fn>
 const ctx = (draftRoute: string | null = ROUTE) => ({ win: window, zapOrigin: ZAP, draftRoute })
 const origin = () => window.location.origin
 const sessionUrl = (path = '/cafes/huila?x=1#nota') =>
-  `${origin()}${ROUTE}?${new URLSearchParams({ token: ZPT, path })}`
+  `${origin()}${ROUTE}#${new URLSearchParams({ token: ZPT, path })}`
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers })
 
@@ -56,6 +56,11 @@ describe('requestDraftSession', () => {
   it('POSTs the draft route and this page’s path with the bearer, no cookies', async () => {
     const result = await requestDraftSession(ctx(), ACCESS)
     expect(result).toMatchObject({ ok: true, url: sessionUrl() })
+    if (!result.ok) throw new Error('unreachable')
+    const navigation = new URL(result.url)
+    expect(navigation.search).toBe('')
+    expect(navigation.origin + navigation.pathname + navigation.search).not.toContain('zpt_')
+    expect(new URLSearchParams(navigation.hash.slice(1)).get('token')).toBe(ZPT)
     const [url, init] = fetchMock.mock.calls[0]! as [string, RequestInit]
     expect(url).toBe(`${ZAP}/api/public/v1/preview/session`)
     expect(init.method).toBe('POST')
@@ -67,8 +72,9 @@ describe('requestDraftSession', () => {
     expect(JSON.parse(String(init.body))).toEqual({
       draftRoute: ROUTE,
       path: '/cafes/huila?x=1#nota',
+      tokenTransport: 'fragment',
     })
-    // The token rides only in the URL of the site's own route, never in storage.
+    // Fragments are omitted from HTTP requests; the token is never stored.
     expect(JSON.stringify({ ...sessionStorage })).not.toContain('zpt_')
   })
 
@@ -122,7 +128,7 @@ describe('requestDraftSession', () => {
 
   it('an answer that would send the tab anywhere else is a failure, not a navigation', async () => {
     fetchMock.mockResolvedValue(
-      json({ url: `https://evil.example${ROUTE}?token=${ZPT}&path=/` }, 201),
+      json({ url: `https://evil.example${ROUTE}#token=${ZPT}&path=/` }, 201),
     )
     expect(await requestDraftSession(ctx(), ACCESS)).toEqual({ ok: false, reason: 'failed' })
     expect(sessionStorage.getItem(EDIT_INTENT_KEY)).toBeNull()
@@ -135,16 +141,34 @@ describe('acceptSessionUrl', () => {
   })
 
   it.each([
-    ['another origin', `https://evil.example${ROUTE}?token=${ZPT}&path=/`],
-    ['another route', `http://localhost:3000/api/other?token=${ZPT}&path=/`],
-    ['no token', `http://localhost:3000${ROUTE}?path=/`],
-    ['a token of another shape', `http://localhost:3000${ROUTE}?token=eel_at_x&path=/`],
-    ['a protocol-relative path', `http://localhost:3000${ROUTE}?token=${ZPT}&path=//evil.example`],
-    ['an absolute path', `http://localhost:3000${ROUTE}?token=${ZPT}&path=https://evil.example`],
+    ['another origin', `https://evil.example${ROUTE}#token=${ZPT}&path=/`],
+    ['another route', `http://localhost:3000/api/other#token=${ZPT}&path=/`],
+    ['no token', `http://localhost:3000${ROUTE}#path=/`],
+    ['a token of another shape', `http://localhost:3000${ROUTE}#token=eel_at_x&path=/`],
+    ['a protocol-relative path', `http://localhost:3000${ROUTE}#token=${ZPT}&path=//evil.example`],
+    ['an absolute path', `http://localhost:3000${ROUTE}#token=${ZPT}&path=https://evil.example`],
+    ['legacy query token', `${origin()}${ROUTE}?token=${ZPT}&path=/`],
+    ['extra query', `${origin()}${ROUTE}?extra=1#token=${ZPT}&path=/`],
+    ['credentials in the URL', sessionUrl().replace('://', '://person:secret@')],
     ['not a URL', 'javascript:alert(1)'],
   ])('refuses %s', (_name, raw) => {
     const url = raw.replace('http://localhost:3000', origin())
     expect(acceptSessionUrl(url, window, ROUTE)).toBeNull()
+  })
+  it.each([
+    '/\\evil.example',
+    '/.//evil.example',
+    '/a/..//evil.example',
+    '/caf\u0000es',
+    '/cafes\n/x',
+    `/cafes/${ZPT}`,
+    `/cafes?token=${ZPT}`,
+    `/cafes#${ZPT}`,
+    `/cafes/${ZPT.replace('p', '%70')}`,
+    `/cafes?token=${ZPT.replace('p', '%70')}`,
+    `/cafes#${ZPT.replace('p', '%70')}`,
+  ])('refuses an unsafe return path %j in the fragment', (path) => {
+    expect(acceptSessionUrl(sessionUrl(path), window, ROUTE)).toBeNull()
   })
 })
 

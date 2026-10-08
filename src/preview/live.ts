@@ -295,9 +295,14 @@ export function initZap(options: InitZapOptions, runtimeOptions: RuntimeOptions 
             // which sets the draft cookies again without navigating, so the
             // next reload still reads drafts. The redirect is not followed.
             if (token && last && last !== token && draftRoute) {
-              const query = new URLSearchParams({ token, path: win.location.pathname })
+              const body = new URLSearchParams({ token, path: win.location.pathname })
               void win
-                .fetch(`${draftRoute}?${query}`, { credentials: 'same-origin', redirect: 'manual' })
+                .fetch(draftRoute, {
+                  method: 'POST',
+                  body,
+                  credentials: 'same-origin',
+                  redirect: 'manual',
+                })
                 .catch(() => {})
             }
           } catch {

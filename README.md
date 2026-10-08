@@ -66,7 +66,7 @@ const { data: posts } = await cms.items.list('blog-posts', {
 | `retry`          | `boolean \| RetryOptions`         | No       | On                       |
 
 `apiKey` is a site API key (`secret_…` or `public_…`), or a preview token
-(`zpt_…`) from a draft-mode URL.
+(`zpt_…`) from a draft-mode exchange.
 
 ### Draft preview
 
@@ -404,22 +404,49 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 import { cookies, draftMode } from 'next/headers'
 import { createDraftModeRoute } from '@8ux-co/eelzap/next'
 
-export const GET = createDraftModeRoute({
+export const POST = createDraftModeRoute({
   siteKey: 'your-site-key',
   apiKey: process.env.EELZAP_API_KEY!, // one of the site's own API keys
   draftMode,
   cookies,
 })
+export const GET = POST
 ```
 
 `<ZapPreview />` tells the editor where the route lives (`/api/zap-preview`
 by default; `draftRoute="/es/preview"` or `draftRoute={null}` otherwise).
 The page names only a path: the editor joins it to the page's own verified
-origin, mints a ten-minute preview token and loads
-`{origin}{route}?token=…&path=…`. The route checks the token with Zap
-(minted for this site, live), enables draft mode with cookies that survive
-inside Zap's frame (`SameSite=None; Secure; Partitioned`) and redirects to the
-page without the token. `createDraftModeExitRoute({ draftMode })` ends it.
+origin and mints a ten-minute preview token. The editor uses the legacy
+`{origin}{route}?token=…&path=…` unless the site's client has announced the
+`fragment-token` capability. The new client advertises that capability; the
+editor then uses `{origin}{route}#token=…&path=…`. Before the first ready/hello
+message, it keeps the query form, so older clients keep working.
+
+URL fragments never reach the HTTP server or its request logs. The route's
+tiny exchange page loads its script from the same route (`?script=1`,
+`application/javascript`), so `script-src 'self'` works without an inline
+script. The script clears the fragment
+from browser history, then submits `token` and `path` in an
+`application/x-www-form-urlencoded` POST body to the same clean route URL.
+POST requires `Sec-Fetch-Site: same-origin` or an `Origin` header equal to the
+request's own origin. Other POSTs, including those missing both headers,
+return `403` without setting cookies. The route checks the token with Zap
+(minted for this site, live), enables
+draft mode with cookies that survive inside Zap's frame
+(`SameSite=None; Secure; Partitioned`) and answers `303` to the clean `path`.
+The target must be a same-origin relative path beginning with a single `/`;
+external URLs, protocol-relative paths, backslashes, control characters and
+paths containing preview tokens are refused. `createDraftModeExitRoute({ draftMode })`
+ends it.
+
+Upgrade the site's route handler and browser client together and export both
+`GET` and `POST` as above before opting into the new exchange. The new live-site
+client sends `tokenTransport: 'fragment'` to `POST /api/public/v1/preview/session`
+and renews drafts with a same-origin POST. Without that field, the API returns
+the legacy query URL. Legacy `GET ?token=…&path=…` remains supported and keeps
+older sites working; those requests can still expose tokens to URL logs.
+Live-site draft-session renewal uses a POST body directly, without navigating
+the tab or putting a token in a request URL.
 
 Read drafts on the server with the token as the credential:
 

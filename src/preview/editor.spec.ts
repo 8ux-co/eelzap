@@ -474,15 +474,43 @@ describe('draft-mode route: joined to the verified origin only', () => {
     expect(bridge.stats['invalid-payload']).toBe(1)
   })
 
-  it('builds {origin}{route}?token&path', () => {
-    expect(
-      draftModeUrl({
-        origin: SITE,
-        draftRoute: '/api/zap-preview',
-        token: TOKEN,
-        path: '/blog/x?a=1',
-      }),
-    ).toBe(`${SITE}/api/zap-preview?token=${TOKEN}&path=%2Fblog%2Fx%3Fa%3D1`)
+  it.each([
+    { capabilities: undefined },
+    { capabilities: [] },
+    { capabilities: ['overlay', 'values'] },
+  ])(
+    'keeps query transport until the site advertises support: $capabilities',
+    ({ capabilities }) => {
+      const url = new URL(
+        draftModeUrl({
+          origin: SITE,
+          draftRoute: '/api/zap-preview',
+          token: TOKEN,
+          path: '/blog/x?a=1',
+          capabilities,
+        })!,
+      )
+      expect(url.searchParams.get('token')).toBe(TOKEN)
+      expect(url.searchParams.get('path')).toBe('/blog/x?a=1')
+      expect(url.hash).toBe('')
+    },
+  )
+
+  it('keeps the token and path in the fragment, outside the request URL', () => {
+    const raw = draftModeUrl({
+      origin: SITE,
+      draftRoute: '/api/zap-preview',
+      token: TOKEN,
+      path: '/blog/x?a=1',
+      capabilities: ['overlay', 'fragment-token'],
+    })!
+    expect(raw).toBe(`${SITE}/api/zap-preview#token=${TOKEN}&path=%2Fblog%2Fx%3Fa%3D1`)
+    const url = new URL(raw)
+    const fragment = new URLSearchParams(url.hash.slice(1))
+    expect(fragment.get('token')).toBe(TOKEN)
+    expect(fragment.get('path')).toBe('/blog/x?a=1')
+    expect(url.search).toBe('')
+    expect(url.origin + url.pathname + url.search).not.toContain('zpt_')
   })
 
   it.each([
@@ -497,6 +525,16 @@ describe('draft-mode route: joined to the verified origin only', () => {
     ['a malformed token', { token: 'secret_abc' }],
     ['a protocol-relative page path', { path: '//evil.example/' }],
     ['a relative page path', { path: 'blog/x' }],
+    ['a backslash page path', { path: '/\\evil.example' }],
+    ['a dot-segment page path collapsing into a host', { path: '/.//evil.example' }],
+    ['another page path collapsing into a host', { path: '/a/..//evil.example' }],
+    ['a control character in the page path', { path: '/blog/\u0000x' }],
+    ['a token in the page pathname', { path: `/blog/${TOKEN}` }],
+    ['a token in the page query', { path: `/blog?token=${TOKEN}` }],
+    ['a token in the page hash', { path: `/blog#${TOKEN}` }],
+    ['an encoded token in the page pathname', { path: `/blog/${TOKEN.replace('p', '%70')}` }],
+    ['an encoded token in the page query', { path: `/blog?token=${TOKEN.replace('p', '%70')}` }],
+    ['an encoded token in the page hash', { path: `/blog#${TOKEN.replace('p', '%70')}` }],
   ] as const)('refuses %s', (_name, override) => {
     expect(
       draftModeUrl({
@@ -507,5 +545,64 @@ describe('draft-mode route: joined to the verified origin only', () => {
         ...override,
       } as Parameters<typeof draftModeUrl>[0]),
     ).toBeNull()
+  })
+})
+
+describe('editor bridge — Comparar (#953)', () => {
+  const MARKS = [
+    { recordRef: 'blog/hola', fieldKey: 'title', tone: 'added' as const, label: 'Título' },
+    {
+      recordRef: 'blog/hola',
+      fieldKey: 'body',
+      tone: 'added' as const,
+      label: 'Cuerpo',
+      active: true,
+    },
+  ]
+  const outgoing = (frameWindow: { postMessage: ReturnType<typeof vi.fn> }, type: string) =>
+    frameWindow.postMessage.mock.calls
+      .map(([m]) => m as { type: string; payload: unknown })
+      .filter((m) => m.type === type)
+      .map((m) => m.payload)
+
+  it('sends scroll sync, scroll-to and marks after the hello; identical marks once', () => {
+    const { bridge, deliver, frameWindow } = setup()
+    bridge.setScrollSync(true)
+    bridge.setMarks(MARKS)
+    expect(frameWindow.postMessage).not.toHaveBeenCalled()
+    deliver(ready())
+    bridge.hello(HELLO)
+    const anchor = { recordRef: 'blog/hola', fieldKey: 'body', nth: 0, offset: -40 }
+    bridge.scrollTo({ y: 0.5, anchor })
+    bridge.setMarks(MARKS.map((m) => ({ ...m }))) // identical: not sent again
+    bridge.setMarks([])
+    expect(outgoing(frameWindow, 'zap:scroll-sync')).toEqual([{ enabled: true }])
+    expect(outgoing(frameWindow, 'zap:scroll-to')).toEqual([{ y: 0.5, anchor }])
+    expect(outgoing(frameWindow, 'zap:marks')).toEqual([{ marks: MARKS }, { marks: [] }])
+  })
+
+  it('a new document gets the same marks again when the panel re-sends them', () => {
+    const { bridge, deliver, frameWindow } = setup()
+    deliver(ready())
+    bridge.hello(HELLO)
+    bridge.setMarks(MARKS)
+    deliver(ready()) // the frame navigated; the new document has no marks
+    bridge.setMarks(MARKS)
+    expect(outgoing(frameWindow, 'zap:marks')).toHaveLength(2)
+  })
+
+  it('hands zap:scroll to the panel, and drops invalid ones', () => {
+    const onScroll = vi.fn()
+    const { bridge, deliver } = setup({ onScroll })
+    deliver(ready())
+    const report = {
+      y: 0.25,
+      anchor: { recordRef: 'blog/hola', fieldKey: 'title', nth: 1, offset: 8 },
+    }
+    deliver(envelope('zap:scroll', SESSION, report))
+    deliver(envelope('zap:scroll', SESSION, { y: 2 }))
+    deliver(envelope('zap:scroll', OTHER, { y: 0.5 }))
+    expect(onScroll.mock.calls).toEqual([[report]])
+    expect(bridge.stats).toMatchObject({ 'invalid-payload': 1, 'wrong-session': 1 })
   })
 })

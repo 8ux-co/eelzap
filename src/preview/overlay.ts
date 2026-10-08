@@ -1,6 +1,7 @@
 import {
   MAX_ANCHORS,
   MAX_PINS,
+  type DiffMark,
   type OverlayMode,
   type OverlayTheme,
   type SpotAnchor,
@@ -34,6 +35,12 @@ import type { TagIndex, TaggedElement } from './tags'
  *   `off` too with `pinsWhenOff`, the live site's «Navegar»), and are the only
  *   things here that take the pointer besides the capture layer.
  *   A click on one is consumed and reported (`onPin`), never also a spot.
+ * - Comparar's diff marks (`setMarks`) are drawn in every mode, `off`
+ *   included, under the other boxes (boards CompararEscritorio /
+ *   CompararMovil): a dashed 1.5px outline in the tone, red #FB2C36 for
+ *   `removed` and green #00C950 for `added`; the active change's is solid
+ *   2px, tinted at 8% and named by a chip (#C10007 / #008236) whose label
+ *   starts with − or +. Divided by the zoom like the outlines.
  * - Boxes are `position: fixed` from `getBoundingClientRect()` and redrawn on
  *   scroll and resize in one animation frame, so nothing in the site's layout
  *   moves.
@@ -63,6 +70,18 @@ export interface OverlayCallbacks {
   onPin?(pin: { id: string }): void
 }
 
+/** A diff mark on one element (`DiffMark`, resolved by the runtime). */
+export interface OverlayMark extends Pick<DiffMark, 'tone' | 'label' | 'active'> {
+  element: Element
+}
+
+/** Outline, tint and chip of each tone (CompararEscritorio). */
+const TONES: Record<DiffMark['tone'], [outline: string, tint: string, chip: string, sign: string]> =
+  {
+    removed: ['#FB2C36', 'rgba(251,44,54,0.08)', '#C10007', '\u2212'],
+    added: ['#00C950', 'rgba(0,201,80,0.08)', '#008236', '+'],
+  }
+
 /** A pin to draw: at a point of the document, or at an element's top-left corner. */
 export interface OverlayPin {
   id: string
@@ -90,7 +109,7 @@ export interface OverlayOptions extends OverlayCallbacks {
   spotOnLarge?: boolean
 }
 
-type BoxKind = 'hover' | 'focus' | 'selected' | 'highlight'
+type BoxKind = 'hover' | 'focus' | 'selected' | 'highlight' | 'mark'
 
 interface Box {
   element: Element
@@ -98,6 +117,8 @@ interface Box {
   label: string | null
   /** A field of another record: «en Configuración», drawn muted after the label. */
   suffix?: string
+  /** A diff mark's tone and whether it is the active one. */
+  mark?: Pick<DiffMark, 'tone' | 'active'>
 }
 
 export class Overlay {
@@ -113,6 +134,7 @@ export class Overlay {
   private highlighted: Element[] = []
   private selected: Element[] = []
   private pins: OverlayPin[] = []
+  private marks: OverlayMark[] = []
   private pending: SpotPoint | null = null
   private capture: HTMLElement | null = null
   private frame: number | null = null
@@ -258,6 +280,12 @@ export class Overlay {
     this.clearPending()
   }
 
+  /** Draw these diff marks (Comparar), in every mode; an empty list clears them. */
+  setMarks(marks: OverlayMark[]): void {
+    this.marks = marks.slice()
+    this.schedule()
+  }
+
   /** Drop the pending spot pin. */
   clearPending(): void {
     this.pending = null
@@ -277,7 +305,7 @@ export class Overlay {
 
   /** For specs: what the closed shadow root currently draws. */
   inspect(): {
-    boxes: Array<{ kind: BoxKind; label: string | null }>
+    boxes: Array<{ kind: BoxKind; label: string | null; tone?: string }>
     pins: HTMLElement[]
     capture: HTMLElement | null
     zoom: number
@@ -288,6 +316,7 @@ export class Overlay {
       .map((node) => ({
         kind: node.dataset.kind as BoxKind,
         label: node.querySelector('.chip')?.textContent ?? null,
+        ...(node.dataset.tone ? { tone: node.dataset.tone } : {}),
       }))
     const capture = this.capture?.style.display === 'block' ? this.capture : null
     return { boxes, pins: nodes.filter((n) => n.className === 'pin'), capture, zoom: this.zoom }
@@ -439,7 +468,15 @@ export class Overlay {
   render(): void {
     const layer = this.layer
     if (!layer) return
-    const boxes: Box[] = []
+    // Marks first, so a focus or hover box on the same element draws over them.
+    const boxes: Box[] = this.marks
+      .filter((mark) => mark.element.isConnected)
+      .map(({ element, tone, label, active }) => ({
+        element,
+        kind: 'mark' as const,
+        label: active ? label : null,
+        mark: { tone, active },
+      }))
     const seen = new Set<Element>()
     const add = (element: Element, kind: BoxKind) => {
       if (seen.has(element) || !element.isConnected) return
@@ -530,14 +567,22 @@ export class Overlay {
     node.className = 'box'
     node.dataset.kind = box.kind
     const offset = 3 / z
+    const mark = box.mark
+    const [markOutline, markTint, markChip, sign] = mark ? TONES[mark.tone] : []
+    if (mark) node.dataset.tone = mark.tone
     Object.assign(node.style, {
       left: `${rect.left - offset}px`,
       top: `${rect.top - offset}px`,
       width: `${rect.width + offset * 2}px`,
       height: `${rect.height + offset * 2}px`,
-      outline: `${px(2)} solid ${this.theme.outline}`,
+      outline: mark
+        ? mark.active
+          ? `${px(2)} solid ${markOutline}`
+          : `${px(1.5)} dashed ${markOutline}`
+        : `${px(2)} solid ${this.theme.outline}`,
       borderRadius: px(3),
-      background: box.kind === 'selected' ? SELECTED_TINT : 'transparent',
+      background:
+        box.kind === 'selected' ? SELECTED_TINT : mark?.active ? markTint! : 'transparent',
     })
     // A chip names the field on hover, on selection and where the editor
     // located it (board CampoLocalizar: the located «Título» carries its
@@ -566,9 +611,15 @@ export class Overlay {
         gap: px(4),
         borderRadius: px(6),
         fontSize: px(12),
-        background: this.theme.chip,
-        color: this.theme.chipText,
+        background: markChip ?? this.theme.chip,
+        color: mark ? '#FFFFFF' : this.theme.chipText,
       })
+      if (sign) {
+        const glyph = doc.createElement('span')
+        glyph.className = 'sign'
+        glyph.textContent = sign
+        chip.appendChild(glyph)
+      }
       if (box.kind === 'selected') {
         const icon = doc.createElement('span')
         icon.className = 'icon'
@@ -624,6 +675,7 @@ const STYLES = `
   letter-spacing: 0; text-transform: none; font-style: normal; box-sizing: border-box;
 }
 .of { font-weight: 400; opacity: .72; }
+.sign { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .capture { position: fixed; inset: 0; pointer-events: auto; cursor: crosshair; display: none; }
 .pin {
   position: fixed; box-sizing: border-box; pointer-events: auto; cursor: pointer; text-align: center;

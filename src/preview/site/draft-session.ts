@@ -1,3 +1,4 @@
+import { safeRedirectPath } from '../draft-path'
 import { isDraftRoutePath } from '../protocol'
 import type { SiteContext } from './config'
 
@@ -155,9 +156,11 @@ export function acceptSessionUrl(raw: unknown, win: Window, draftRoute: string):
     return null
   }
   if (url.origin !== win.location.origin || url.pathname !== draftRoute) return null
-  if (!/^zpt_[A-Za-z0-9_-]{43}$/.test(url.searchParams.get('token') ?? '')) return null
-  const path = url.searchParams.get('path') ?? ''
-  if (!path.startsWith('/') || path.startsWith('//')) return null
+  if (url.username || url.password || url.search) return null
+  const params = new URLSearchParams(url.hash.slice(1))
+  if (!/^zpt_[A-Za-z0-9_-]{43}$/.test(params.get('token') ?? '')) return null
+  const path = params.get('path') ?? ''
+  if (safeRedirectPath(path, win.location.href) === null) return null
   return url.toString()
 }
 
@@ -179,7 +182,7 @@ export async function requestDraftSession(
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       credentials: 'omit',
-      body: JSON.stringify({ draftRoute, path: currentPath(win) }),
+      body: JSON.stringify({ draftRoute, path: currentPath(win), tokenTransport: 'fragment' }),
     })
   } catch {
     return { ok: false, reason: 'refused' }

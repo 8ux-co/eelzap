@@ -155,7 +155,7 @@ beforeEach(() => {
     session: () =>
       json(
         {
-          url: `${window.location.origin}${ROUTE}?${new URLSearchParams({ token: ZPT, path: '/blog/hola' })}`,
+          url: `${window.location.origin}${ROUTE}#${new URLSearchParams({ token: ZPT, path: '/blog/hola' })}`,
           path: '/blog/hola',
           expiresAt: new Date(Date.now() + 600_000).toISOString(),
         },
@@ -218,9 +218,13 @@ describe('item 13: Editar on the live site through a draft session', () => {
     const [[url, init]] = sessionPosts()
     expect(url).toBe(`${ZAP}/api/public/v1/preview/session`)
     expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${ACCESS}`)
-    expect(JSON.parse(String(init.body))).toEqual({ draftRoute: ROUTE, path: '/blog/hola' })
+    expect(JSON.parse(String(init.body))).toEqual({
+      draftRoute: ROUTE,
+      path: '/blog/hola',
+      tokenTransport: 'fragment',
+    })
 
-    const target = `${window.location.origin}${ROUTE}?${new URLSearchParams({ token: ZPT, path: '/blog/hola' })}`
+    const target = `${window.location.origin}${ROUTE}#${new URLSearchParams({ token: ZPT, path: '/blog/hola' })}`
     answer(
       json(
         {
@@ -236,7 +240,11 @@ describe('item 13: Editar on the live site through a draft session', () => {
     const sent = new URL(assign.mock.calls[0]![0] as string)
     expect(sent.origin).toBe(window.location.origin)
     expect(sent.pathname).toBe(ROUTE)
-    expect(sent.searchParams.get('path')).toBe('/blog/hola')
+    const fragment = new URLSearchParams(sent.hash.slice(1))
+    expect(fragment.get('path')).toBe('/blog/hola')
+    expect(fragment.get('token')).toBe(ZPT)
+    expect(sent.search).toBe('')
+    expect(sent.origin + sent.pathname + sent.search).not.toContain('zpt_')
     // Editar reopens after the reload.
     expect(JSON.parse(sessionStorage.getItem(EDIT_INTENT_KEY)!)).toMatchObject({
       path: '/blog/hola',

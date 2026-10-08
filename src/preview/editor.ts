@@ -1,3 +1,4 @@
+import { safeRedirectPath } from './draft-path'
 import {
   emptyDropStats,
   isDraftRoutePath,
@@ -9,6 +10,7 @@ import {
   PAGE_UNLOAD_ERROR,
   parsePageMessage,
   utf8Length,
+  type DiffMark,
   type DomAnchor,
   type DropReason,
   type DropStats,
@@ -21,6 +23,7 @@ import {
   type Pin,
   type PreviewValue,
   type RecordRef,
+  type ScrollPayload,
 } from './protocol'
 
 /**
@@ -100,6 +103,12 @@ export interface EditorBridgeHandlers {
   onPin?(payload: PageMessages['zap:pin']): void
   /** The page's runaway guard stopped following the page; it writes no more values. */
   onPaused?(payload: PageMessages['zap:paused']): void
+  /**
+   * The page scrolled while scroll sync is on (`scroll-sync` capability).
+   * Never sent for a `scrollTo`, so passing it to the other frame's
+   * `scrollTo` cannot loop.
+   */
+  onScroll?(payload: PageMessages['zap:scroll']): void
   onDrop?(reason: DropReason): void
 }
 
@@ -153,6 +162,19 @@ export interface EditorBridge {
    * document starts with none, so send its pins again from `onReady`.
    */
   setPins(pins: Pin[]): void
+  /**
+   * Start or stop `onScroll` reports (`scroll-sync` capability). A new
+   * document starts with sync off: enable it again from `onReady`.
+   */
+  setScrollSync(enabled: boolean): void
+  /** Place the page: by `anchor` when the page has that element, else by the fractions. */
+  scrollTo(target: ScrollPayload): void
+  /**
+   * Comparar's diff marks (`diff-marks` capability), ≤ 200; an empty list
+   * clears them. Identical consecutive sets are sent once; a new document
+   * starts with none, so send them again from `onReady`.
+   */
+  setMarks(marks: DiffMark[]): void
   destroy(): void
 }
 
@@ -169,11 +191,14 @@ export interface DraftModeUrlInput {
   token: string
   /** The page path to land on after the exchange (`/blog/hola`). */
   path: string
+  /** Fragment transport is opt-in, advertised by the site in `zap:ready`. */
+  capabilities?: readonly string[]
 }
 
 /**
  * The draft-mode URL to load in the frame (§2.5, §7.5):
- * `{origin}{draftRoute}?token=…&path=…`, or null when anything is off. The
+ * `{origin}{draftRoute}?token=…&path=…` by default, or `#token=…&path=…`
+ * when the site advertises `fragment-token`; null when anything is off. The
  * page names only a PATH; the host is always the frame's verified origin, so
  * a hostile page cannot route the token elsewhere: a route that is not a
  * plain path (`isDraftRoutePath`), an origin that is not a bare http(s)
@@ -184,7 +209,7 @@ export interface DraftModeUrlInput {
 export function draftModeUrl(input: DraftModeUrlInput): string | null {
   const { origin, draftRoute, token, path } = input
   if (!isDraftRoutePath(draftRoute) || !isPreviewTokenShape(token)) return null
-  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) return null
+  if (typeof path !== 'string' || safeRedirectPath(path, origin) === null) return null
   let url: URL
   try {
     const base = new URL(origin)
@@ -196,7 +221,9 @@ export function draftModeUrl(input: DraftModeUrlInput): string | null {
     return null
   }
   if (url.origin !== origin || url.pathname !== draftRoute) return null
-  url.search = new URLSearchParams({ token, path }).toString()
+  const params = new URLSearchParams({ token, path }).toString()
+  if (input.capabilities?.includes('fragment-token')) url.hash = params
+  else url.search = params
   return url.toString()
 }
 
@@ -227,6 +254,7 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
   let currentZoom: number | null = null
   /** The last pins sent to this document, to skip identical re-sends. */
   let sentPins: string | null = null
+  let sentMarks: string | null = null
   const queue: Outgoing[] = []
 
   // Values state.
@@ -301,6 +329,7 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
         if (again) {
           helloSent = false
           sentPins = null
+          sentMarks = null
           sentScope = null
           sentJson.clear()
           queue.length = 0
@@ -333,6 +362,8 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
         return handlers.onPin?.(message.payload)
       case 'zap:paused':
         return handlers.onPaused?.(message.payload)
+      case 'zap:scroll':
+        return handlers.onScroll?.(message.payload)
       case 'zap:error':
         if (message.payload.code === PAGE_UNLOAD_ERROR) {
           // Hold everything for the next document's ready.
@@ -432,6 +463,18 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
       sentPins = json
       send({ type: 'zap:pins', payload: { pins } })
     },
+    setScrollSync(enabled) {
+      send({ type: 'zap:scroll-sync', payload: { enabled } })
+    },
+    scrollTo(target) {
+      send({ type: 'zap:scroll-to', payload: target })
+    },
+    setMarks(marks) {
+      const json = JSON.stringify(marks)
+      if (json === sentMarks) return
+      sentMarks = json
+      send({ type: 'zap:marks', payload: { marks } })
+    },
     destroy() {
       destroyed = true
       win.removeEventListener('message', listener)
@@ -443,15 +486,19 @@ export function createEditorBridge(options: EditorBridgeOptions): EditorBridge {
 export {
   CAPABILITIES,
   isDraftRoutePath,
+  isDiffMark,
   isPin,
   isSession,
   MAX_ANCHORS,
+  MAX_MARK_LABEL,
+  MAX_MARKS,
   MAX_MESSAGE_BYTES,
   MAX_PINS,
   PAGE_UNLOAD_ERROR,
   parsePageMessage,
   type Capability,
   type ClickPayload,
+  type DiffMark,
   type DomAnchor,
   type DropReason,
   type HelloPayload,
@@ -463,6 +510,8 @@ export {
   type Pin,
   type PreviewValue,
   type RecordRef,
+  type ScrollAnchor,
+  type ScrollPayload,
   type SpotAnchor,
   type SpotPayload,
   type SpotPoint,

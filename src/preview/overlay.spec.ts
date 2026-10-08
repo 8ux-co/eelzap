@@ -703,3 +703,107 @@ describe('the chip resets inherited type styles', () => {
     expect(rule).toContain('font-style: normal')
   })
 })
+
+describe('Overlay — Comparar diff marks', () => {
+  const MARKED = `${PAGE}<h2 data-zap="blog/hola#title">Hola otra vez</h2>`
+  const marksOf = (index: TagIndex, tone: 'removed' | 'added', active: boolean, label = 'Título') =>
+    index.byField('blog/hola', 'title').map(({ element }) => ({ element, tone, label, active }))
+  /** The chip's parts: the sign in its own monospace span, then the label as text. */
+  const chipOf = (overlay: Overlay, n: number) => {
+    const chip = layerOf(overlay).children[n]!.querySelector('.chip')
+    return chip && [chip.querySelector('.sign')?.textContent, chip.lastChild?.textContent]
+  }
+
+  it('marks every element of the field: dashed in the tone, no tint, no chip (CompararEscritorio)', () => {
+    const { overlay, index } = setup(MARKED)
+    overlay.setMarks(marksOf(index, 'removed', false))
+    overlay.render()
+    expect(overlay.inspect().boxes).toEqual([
+      { kind: 'mark', label: null, tone: 'removed' },
+      { kind: 'mark', label: null, tone: 'removed' },
+    ])
+    expect(overlay.boxStyle(0)!.outline).toBe('1.5px dashed #FB2C36')
+    expect(overlay.boxStyle(0)!.background).toBe('transparent')
+
+    overlay.setMarks(marksOf(index, 'added', false))
+    overlay.render()
+    expect(overlay.boxStyle(1)!.outline).toBe('1.5px dashed #00C950')
+  })
+
+  it('the active change is solid, tinted and named: − on the published side, + on the draft', () => {
+    const { overlay, index } = setup(MARKED)
+    overlay.setMarks(marksOf(index, 'removed', true))
+    overlay.render()
+    expect(overlay.inspect().boxes[0]).toEqual({ kind: 'mark', label: '−Título', tone: 'removed' })
+    expect(overlay.boxStyle(0)!.outline).toBe('2px solid #FB2C36')
+    expect(overlay.boxStyle(0)!.background.replace(/\s/g, '')).toBe('rgba(251,44,54,0.08)')
+    expect(chipOf(overlay, 0)).toEqual(['−', 'Título'])
+    const chip = layerOf(overlay).children[0]!.querySelector<HTMLElement>('.chip')!
+    expect(chip.style.background.replace(/\s/g, '')).toBe('rgb(193,0,7)') // #C10007
+
+    overlay.setMarks(marksOf(index, 'added', true))
+    overlay.render()
+    expect(overlay.boxStyle(0)!.outline).toBe('2px solid #00C950')
+    expect(overlay.boxStyle(0)!.background.replace(/\s/g, '')).toBe('rgba(0,201,80,0.08)')
+    expect(chipOf(overlay, 0)).toEqual(['+', 'Título'])
+    const added = layerOf(overlay).children[0]!.querySelector<HTMLElement>('.chip')!
+    expect(added.style.background.replace(/\s/g, '')).toBe('rgb(0,130,54)') // #008236
+  })
+
+  it('divides the outline and the chip by the zoom', () => {
+    const { overlay, index } = setup(MARKED)
+    overlay.setZoom(0.5)
+    overlay.setMarks([
+      ...marksOf(index, 'added', false).slice(0, 1),
+      ...marksOf(index, 'added', true).slice(1),
+    ])
+    overlay.render()
+    expect(overlay.boxStyle(0)!.outline).toBe('3px dashed #00C950')
+    expect(overlay.boxStyle(1)!.outline).toBe('4px solid #00C950')
+    const chip = layerOf(overlay).children[1]!.querySelector<HTMLElement>('.chip')!
+    expect(chip.style.fontSize).toBe('24px')
+  })
+
+  it('draws in every mode, off included, under a focus box on the same element; [] clears', () => {
+    const { overlay, index } = setup(MARKED)
+    overlay.setMarks(marksOf(index, 'removed', false))
+    overlay.render()
+    expect(overlay.getMode()).toBe('off')
+    expect(overlay.inspect().boxes.map((b) => b.kind)).toEqual(['mark', 'mark'])
+
+    vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
+    overlay.setMode('inspect')
+    overlay.focusField([index.byField('blog/hola', 'title')[0]!.element])
+    overlay.render()
+    expect(overlay.inspect().boxes.map((b) => b.kind)).toEqual(['mark', 'mark', 'focus'])
+
+    overlay.setMarks([])
+    overlay.render()
+    expect(overlay.inspect().boxes.map((b) => b.kind)).toEqual(['focus'])
+  })
+
+  it('follows the element when the page scrolls or reflows, and drops one that left the page', () => {
+    const { overlay, index } = setup(MARKED)
+    const [first, second] = index.byField('blog/hola', 'title').map((t) => t.element)
+    placed(first!, 100, 40)
+    overlay.setMarks(marksOf(index, 'removed', false))
+    overlay.render()
+    expect(overlay.boxStyle(0)!.top).toBe('97px')
+    placed(first!, -20, 40)
+    window.dispatchEvent(new Event('scroll'))
+    overlay.render()
+    expect(overlay.boxStyle(0)!.top).toBe('-23px')
+    second!.remove()
+    overlay.render()
+    expect(overlay.inspect().boxes).toHaveLength(1)
+  })
+
+  it('renders a mark label as text, never markup', () => {
+    const { overlay, index } = setup(MARKED)
+    overlay.setMarks(marksOf(index, 'added', true, '<img src=x onerror=alert(1)>'))
+    overlay.render()
+    const layer = layerOf(overlay)
+    expect(layer.querySelector('img')).toBeNull()
+    expect(chipOf(overlay, 0)).toEqual(['+', '<img src=x onerror=alert(1)>'])
+  })
+})

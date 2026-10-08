@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - Unreleased
+
+### Added
+
+- Comparar support in the preview client, for Zap's side-by-side view of the published page and the draft. Two new capabilities in `zap:ready`, so the editor offers each only to a client that has it:
+  - `scroll-sync`: `zap:scroll-sync` `{ enabled }` turns on `zap:scroll` `{ y, x?, anchor? }` reports, one per animation frame at most, with the scroll position as fractions and the tagged field nearest the top as an anchor (`{ recordRef, fieldKey, nth, offset }`). `zap:scroll-to` (same shape) places the page by the anchor, or by the fraction when the page lacks that field, and is never reported back, so two frames cannot chase each other.
+  - `diff-marks`: `zap:marks` `{ marks: [{ recordRef, fieldKey, tone, label, active? }] }` (up to 200) marks every element of each field, red for `removed` and green for `added`, the active change tinted and named. An empty list clears them; marks follow scrolling and re-rendering.
+- The editor bridge (`@8ux-co/eelzap/internal/editor`) adds `setScrollSync`, `scrollTo`, `setMarks` and the `onScroll` handler.
+- Opt-in fragment transport for preview tokens (#947). The client advertises
+  `fragment-token` to the editor and sends `tokenTransport: 'fragment'` to the
+  live-site session API. Without either opt-in, legacy query URLs remain the
+  default, so sites on SDK 0.10.2 and earlier keep working, including the editor's
+  first load before the client announces its capabilities.
+- `createDraftModeRoute` exchanges fragment tokens through a same-origin POST
+  body and redirects with `303` to a validated clean path. Its exchange page
+  loads an external script from the same route (`?script=1`), supporting
+  `script-src 'self'`. POST requires `Sec-Fetch-Site: same-origin` or an `Origin`
+  equal to the request's own origin; otherwise it returns `403` without cookies.
+
+### Changed
+
+- `zap:ready` reports client version `0.11.0`.
+- The 0.11 client renews live-site draft sessions with a same-origin POST to the
+  site's draft route.
+
+### Migration
+
+- **Upgrading to 0.11 requires the site's draft route to export `POST` as well
+  as `GET`**, for example `export const POST = createDraftModeRoute({ … })` and
+  `export const GET = POST` (see the README), or `export const { GET, POST } = …`
+  in an equivalent wrapper. A route that exports only `GET` answers `405` to the
+  new client and editor preview breaks. Upgrade the route handler and the
+  browser client together. Sites on the script-tag (CDN boot) snippet that adopt
+  the new snippet need the same `GET` and `POST` route.
+- Legacy `GET ?token=…` remains supported for older clients; its query tokens
+  can still appear in site request logs. Only fragment exchanges keep tokens out
+  of request URLs.
+- Deploy order: Zap must ship to production (the session API's
+  `tokenTransport: 'fragment'` and the 0.11.0 CDN bundles) before 0.11.0 is
+  published to npm, since the published boot pins those bundles by path and SRI.
+
 ## [0.10.2] - Unreleased
 
 ### Added

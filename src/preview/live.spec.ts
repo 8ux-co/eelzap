@@ -350,10 +350,20 @@ describe('initZap: draft route, stega and values for code bundled apart (zap-cms
   const readyOf = (parent: { postMessage: ReturnType<typeof vi.fn> }) =>
     parent.postMessage.mock.calls.map(([m]) => m).find((m) => m.type === 'zap:ready')!.payload
 
-  it('announces the draft-mode route path and the stega, pins, links and refresh capabilities in zap:ready', () => {
+  it('announces the draft-mode route path and every capability, scroll-sync and diff-marks included, in zap:ready', () => {
     const { parent } = boot({ draftRoute: '/api/zap-preview' })
     expect(readyOf(parent)).toMatchObject({
-      capabilities: ['overlay', 'values', 'stega', 'pins', 'links', 'refresh'],
+      capabilities: [
+        'overlay',
+        'values',
+        'stega',
+        'pins',
+        'links',
+        'refresh',
+        'scroll-sync',
+        'diff-marks',
+        'fragment-token',
+      ],
       draftRoute: '/api/zap-preview',
     })
   })
@@ -435,12 +445,18 @@ describe('initZap: a renewed preview token resets the draft cookies in the backg
     deliver(hello(SESSION, { previewToken: RENEWED }))
     expect(fetch).toHaveBeenCalledTimes(1)
     const [url, init] = fetch.mock.calls[0]!
-    expect(String(url).startsWith(`${ROUTE}?`)).toBe(true)
-    const query = new URL(String(url), location.href).searchParams
+    expect(url).toBe(ROUTE)
+    expect(String(url)).not.toContain(RENEWED)
+    const query = new URLSearchParams(init?.body as URLSearchParams)
     expect([...query.keys()]).toEqual(['token', 'path'])
     expect(query.get('token')).toBe(RENEWED)
     expect(query.get('path')).toBe(location.pathname)
-    expect(init).toEqual({ credentials: 'same-origin', redirect: 'manual' })
+    expect(init).toEqual({
+      method: 'POST',
+      body: query,
+      credentials: 'same-origin',
+      redirect: 'manual',
+    })
     expect(sessionStorage.getItem(PREVIEW_TOKEN_STORAGE_KEY)).toBe(RENEWED)
   })
 
@@ -451,7 +467,8 @@ describe('initZap: a renewed preview token resets the draft cookies in the backg
     expect(fetch).not.toHaveBeenCalled()
     deliver(hello(SESSION, { previewToken: RENEWED }))
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(new URL(String(fetch.mock.calls[0]![0]), location.href).searchParams.get('token')).toBe(
+    expect(fetch.mock.calls[0]![0]).toBe(ROUTE)
+    expect(new URLSearchParams(fetch.mock.calls[0]![1]?.body as URLSearchParams).get('token')).toBe(
       RENEWED,
     )
   })

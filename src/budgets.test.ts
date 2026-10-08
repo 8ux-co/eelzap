@@ -74,7 +74,7 @@ describe('size budgets per subpath (§2.7)', () => {
     expect(gz(code)).toBeLessThanOrEqual(BUDGETS.fields)
   }, 30_000)
 
-  it('`./next` stays under 2 KB, React and Next excluded, and never bundles the overlay', async () => {
+  it('`./next` stays within its budget, React and Next excluded, and never bundles the overlay', async () => {
     const result = await build({
       entryPoints: [NPM_ENTRIES.next],
       bundle: true,

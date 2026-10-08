@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  CAPABILITIES,
   envelope,
   isDraftRoutePath,
   isPreviewValue,
   MAX_LABELS,
+  MAX_MARK_LABEL,
+  MAX_MARKS,
   MAX_MESSAGE_BYTES,
   parseEditorMessage,
   parsePageMessage,
@@ -406,7 +409,7 @@ describe('comment pins and spots', () => {
     })
   })
 
-  it('a ready may advertise pins; an unknown capability still fails it', () => {
+  it('a ready may advertise pins; an unknown capability is ignored, never a refusal', () => {
     const ready = (capabilities: unknown) =>
       parsePageMessage(
         envelope('zap:ready', '', { version: '0.11.0', capabilities, pageUrl: 'https://e.co/' }),
@@ -414,7 +417,14 @@ describe('comment pins and spots', () => {
     expect(ready(['overlay', 'values', 'stega', 'pins'])).toBe(true)
     expect(ready(['overlay', 'values', 'stega', 'pins', 'links'])).toBe(true)
     expect(ready(['overlay', 'values', 'stega', 'pins', 'links', 'refresh'])).toBe(true)
-    expect(ready(['overlay', 'comments'])).toBe(false)
+    expect(
+      ready(['overlay', 'values', 'stega', 'pins', 'links', 'refresh', 'fragment-token']),
+    ).toBe(true)
+    // A newer client's capability this editor does not know yet still connects.
+    expect(ready(['overlay', 'comments'])).toBe(true)
+    expect(ready(['overlay', 'x'.repeat(33)])).toBe(false)
+    expect(ready(['overlay', 7])).toBe(false)
+    expect(ready(Array.from({ length: 33 }, (_, i) => `c${i}`))).toBe(false)
   })
 })
 
@@ -508,5 +518,110 @@ describe('zap:click rect and zap:refresh', () => {
       ok: false,
       reason: 'unknown-type',
     })
+  })
+})
+
+/**
+ * Comparar (#953): `zap:scroll-sync`, `zap:scroll-to` and `zap:marks` editor →
+ * page, `zap:scroll` page → editor, capabilities `scroll-sync` and
+ * `diff-marks`.
+ */
+describe('Comparar: scroll sync and diff marks', () => {
+  const anchor = { recordRef: 'blog/x', fieldKey: 'title', nth: 0, offset: -120 }
+  const mark = { recordRef: 'blog/x', fieldKey: 'title', tone: 'removed', label: 'Título' }
+  const editor = (type: string, payload: unknown) =>
+    parseEditorMessage(envelope(type, SESSION, payload))
+  const page = (type: string, payload: unknown) =>
+    parsePageMessage(envelope(type, SESSION, payload))
+
+  it('a ready may advertise scroll-sync and diff-marks', () => {
+    const ready = parsePageMessage(
+      envelope('zap:ready', '', {
+        version: '0.11.0',
+        capabilities: [...CAPABILITIES],
+        pageUrl: 'https://e.co/',
+      }),
+    )
+    expect(ready.ok).toBe(true)
+    expect(CAPABILITIES).toEqual(expect.arrayContaining(['scroll-sync', 'diff-marks']))
+  })
+
+  it('zap:scroll-sync carries a boolean, nothing else', () => {
+    expect(editor('zap:scroll-sync', { enabled: true }).ok).toBe(true)
+    expect(editor('zap:scroll-sync', { enabled: false }).ok).toBe(true)
+    for (const payload of [{}, { enabled: 'true' }, { enabled: 1 }, true, null]) {
+      expect(editor('zap:scroll-sync', payload)).toEqual({ ok: false, reason: 'invalid-payload' })
+    }
+  })
+
+  it('zap:scroll and zap:scroll-to accept a fraction, x, an anchor, the bounds exactly', () => {
+    for (const type of ['zap:scroll', 'zap:scroll-to']) {
+      const parse = type === 'zap:scroll' ? page : editor
+      expect(parse(type, { y: 0 }).ok, type).toBe(true)
+      expect(parse(type, { y: 1, x: 0 }).ok, type).toBe(true)
+      expect(parse(type, { y: 0.5, anchor }).ok, type).toBe(true)
+      expect(parse(type, { y: 0.5, anchor: { ...anchor, nth: 5000, offset: 1e7 } }).ok).toBe(true)
+      expect(parse(type, { y: 0.5, anchor: { ...anchor, offset: -1e7 } }).ok).toBe(true)
+    }
+  })
+
+  it.each([
+    ['y over 1', { y: 1.01 }],
+    ['y under 0', { y: -0.01 }],
+    ['a NaN y', { y: NaN }],
+    ['no y', { anchor }],
+    ['a string y', { y: '0.5' }],
+    ['x over 1', { y: 0, x: 2 }],
+    ['an anchor with a bad record', { y: 0, anchor: { ...anchor, recordRef: 'Blog/x' } }],
+    ['an anchor with a bad field key', { y: 0, anchor: { ...anchor, fieldKey: 'Ti tle' } }],
+    ['an anchor without nth', { y: 0, anchor: { ...anchor, nth: undefined } }],
+    ['a negative nth', { y: 0, anchor: { ...anchor, nth: -1 } }],
+    ['a fractional nth', { y: 0, anchor: { ...anchor, nth: 0.5 } }],
+    ['nth over the cap', { y: 0, anchor: { ...anchor, nth: 5001 } }],
+    ['an offset past the bounds', { y: 0, anchor: { ...anchor, offset: 1e7 + 1 } }],
+    ['an infinite offset', { y: 0, anchor: { ...anchor, offset: -Infinity } }],
+    ['a non-object', 0.5],
+  ])('zap:scroll and zap:scroll-to refuse %s', (_name, payload) => {
+    expect(page('zap:scroll', payload)).toEqual({ ok: false, reason: 'invalid-payload' })
+    expect(editor('zap:scroll-to', payload)).toEqual({ ok: false, reason: 'invalid-payload' })
+  })
+
+  it('zap:marks accepts both tones, active or not, the limits exactly, and an empty list', () => {
+    expect(editor('zap:marks', { marks: [] }).ok).toBe(true)
+    expect(
+      editor('zap:marks', {
+        marks: [mark, { ...mark, tone: 'added', active: true }, { ...mark, active: false }],
+      }).ok,
+    ).toBe(true)
+    expect(
+      editor('zap:marks', {
+        marks: Array(MAX_MARKS).fill({ ...mark, label: 'a'.repeat(MAX_MARK_LABEL) }),
+      }).ok,
+    ).toBe(true)
+  })
+
+  it.each([
+    [`${MAX_MARKS + 1} marks`, Array(MAX_MARKS + 1).fill(mark)],
+    ['a label over the cap', [{ ...mark, label: 'a'.repeat(MAX_MARK_LABEL + 1) }]],
+    ['no label', [{ ...mark, label: undefined }]],
+    ['an unknown tone', [{ ...mark, tone: 'changed' }]],
+    ['no tone', [{ ...mark, tone: undefined }]],
+    ['active as a string', [{ ...mark, active: 'yes' }]],
+    ['a bad record', [{ ...mark, recordRef: 'javascript:x' }]],
+    ['a bad field key', [{ ...mark, fieldKey: '<b>' }]],
+    ['one bad mark among good ones', [mark, { ...mark, tone: 'red' }]],
+    ['marks not a list', { 0: mark }],
+  ])('zap:marks refuses %s', (_name, marks) => {
+    expect(editor('zap:marks', { marks })).toEqual({ ok: false, reason: 'invalid-payload' })
+  })
+
+  it('each new type is known in its direction only', () => {
+    expect(page('zap:scroll-sync', { enabled: true })).toEqual({
+      ok: false,
+      reason: 'unknown-type',
+    })
+    expect(page('zap:scroll-to', { y: 0 })).toEqual({ ok: false, reason: 'unknown-type' })
+    expect(page('zap:marks', { marks: [] })).toEqual({ ok: false, reason: 'unknown-type' })
+    expect(editor('zap:scroll', { y: 0 })).toEqual({ ok: false, reason: 'unknown-type' })
   })
 })

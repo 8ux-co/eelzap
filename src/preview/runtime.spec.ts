@@ -91,7 +91,17 @@ describe('page runtime', () => {
     expect(messages[0]).toMatchObject({
       session: '',
       payload: {
-        capabilities: ['overlay', 'values', 'stega', 'pins', 'links', 'refresh'],
+        capabilities: [
+          'overlay',
+          'values',
+          'stega',
+          'pins',
+          'links',
+          'refresh',
+          'scroll-sync',
+          'diff-marks',
+          'fragment-token',
+        ],
         pageUrl: PAGE_URL,
         draftRoute: null,
       },
@@ -420,5 +430,98 @@ describe('page runtime', () => {
     expect(runtime.overlay.inspect().boxes).toEqual([
       { kind: 'hover', label: 'Títuloen Configuración' },
     ])
+  })
+})
+
+describe('page runtime — Comparar (#953)', () => {
+  /** The real window, its scroll position and `scrollTo` faked (jsdom does not scroll). */
+  function scrollingWindow() {
+    const state = { scrollX: 0, scrollY: 0 }
+    const scrollTo = vi.fn((options: ScrollToOptions) => {
+      state.scrollY = options.top ?? state.scrollY
+      window.dispatchEvent(new Event('scroll'))
+    })
+    const win = new Proxy(window, {
+      get(target, key) {
+        if (key === 'scrollY' || key === 'scrollX') return state[key]
+        if (key === 'scrollTo') return scrollTo
+        if (key === 'requestAnimationFrame') return undefined
+        const value = Reflect.get(target, key)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    return { win, state, scrollTo }
+  }
+  const ofType = (messages: Array<{ type: string; payload: unknown }>, type: string) =>
+    messages.filter((m) => m.type === type).map((m) => m.payload)
+
+  it('reports scrolls only while the editor has sync on', () => {
+    vi.useFakeTimers()
+    const { win, state } = scrollingWindow()
+    vi.spyOn(document.documentElement, 'scrollHeight', 'get').mockReturnValue(2768)
+    const { posted, deliver, hello } = boot(PAGE, win)
+    hello('off')
+    state.scrollY = 500
+    window.dispatchEvent(new Event('scroll'))
+    vi.advanceTimersByTime(16)
+    expect(ofType(posted(), 'zap:scroll')).toEqual([])
+
+    deliver('zap:scroll-sync', { enabled: true })
+    state.scrollY = 1000
+    window.dispatchEvent(new Event('scroll'))
+    vi.advanceTimersByTime(16)
+    expect(ofType(posted(), 'zap:scroll')).toEqual([{ y: 0.25 }, { y: 0.5 }])
+    expect(posted().at(-1)).toMatchObject({ type: 'zap:scroll', session: SESSION })
+
+    deliver('zap:scroll-sync', { enabled: false })
+    state.scrollY = 0
+    window.dispatchEvent(new Event('scroll'))
+    vi.advanceTimersByTime(16)
+    expect(ofType(posted(), 'zap:scroll')).toHaveLength(2)
+  })
+
+  it('applies zap:scroll-to and never echoes it as a scroll', () => {
+    vi.useFakeTimers()
+    const { win, scrollTo } = scrollingWindow()
+    vi.spyOn(document.documentElement, 'scrollHeight', 'get').mockReturnValue(2768)
+    const { posted, deliver, hello } = boot(PAGE, win)
+    hello('off')
+    deliver('zap:scroll-sync', { enabled: true })
+    deliver('zap:scroll-to', { y: 0.75 })
+    vi.advanceTimersByTime(100)
+    expect(scrollTo).toHaveBeenCalledWith({ top: 1500, left: 0, behavior: 'instant' })
+    expect(ofType(posted(), 'zap:scroll')).toEqual([{ y: 0 }])
+  })
+
+  it('draws zap:marks on every element of each field, again after a rescan; [] clears', () => {
+    const { runtime, deliver, hello } = boot(PAGE)
+    hello('off')
+    deliver('zap:marks', {
+      marks: [
+        { recordRef: 'blog/hola', fieldKey: 'title', tone: 'added', label: 'Título', active: true },
+        { recordRef: 'blog/hola', fieldKey: 'body', tone: 'added', label: 'Cuerpo' },
+        { recordRef: 'blog/hola', fieldKey: 'missing', tone: 'added', label: 'Nada' },
+      ],
+    })
+    runtime.overlay.render()
+    expect(runtime.overlay.inspect().boxes).toEqual([
+      { kind: 'mark', label: '+Título', tone: 'added' },
+      { kind: 'mark', label: null, tone: 'added' },
+    ])
+
+    document
+      .querySelector('main')!
+      .insertAdjacentHTML('beforeend', '<h2 data-zap="blog/hola#title">Hola</h2>')
+    runtime.refresh()
+    runtime.overlay.render()
+    expect(runtime.overlay.inspect().boxes.map((b) => b.label)).toEqual([
+      '+Título',
+      '+Título',
+      null,
+    ])
+
+    deliver('zap:marks', { marks: [] })
+    runtime.overlay.render()
+    expect(runtime.overlay.inspect().boxes).toEqual([])
   })
 })

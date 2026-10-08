@@ -51,6 +51,18 @@ import { isFieldKey, isPreviewTokenShape, isRecordRef, type RecordRef } from '..
  *   tagged elements, `runaway` when the count kept growing with nothing on
  *   the page explaining it. The page stops writing values; the editor offers
  *   a reload. Sent again after a hello, which a pause before it never reached.
+ * - Comparar (#953), two frames of one page side by side, the published one
+ *   and the draft. Scroll sync, only to a page whose `zap:ready` advertised
+ *   `scroll-sync`: `zap:scroll-sync` (editor → page) `{ enabled }` starts or
+ *   stops `zap:scroll` (page → editor) `{ y, x?, anchor? }`, one per animation
+ *   frame at most, positions as fractions (0..1) of the scrollable range and
+ *   `anchor` the tagged field nearest the viewport's top; `zap:scroll-to`
+ *   (editor → page, same shape) places the page there, by the anchor when
+ *   the page has that field, else by the fraction, and is never echoed back.
+ *   Diff marks, only to a page whose `zap:ready` advertised `diff-marks`:
+ *   `zap:marks` (editor → page) `{ marks }`, every element of each field
+ *   marked in its tone, removed (published) or added (draft); ≤ 200 marks,
+ *   an empty list clears them.
  */
 
 export const PROTOCOL_SOURCE = 'eel-zap'
@@ -75,12 +87,29 @@ export const MAX_TAG_REPORT = 2000
 export const MAX_LABELS = 500
 /** Pins drawn at once (`zap:pins`). */
 export const MAX_PINS = 50
+/** Diff marks drawn at once (`zap:marks`), and the longest mark label. */
+export const MAX_MARKS = 200
+export const MAX_MARK_LABEL = 200
+/** Highest occurrence index a scroll anchor may name (`MAX_TAGGED` in `tags.ts`). */
+export const MAX_ANCHOR_NTH = 5000
 
 export type OverlayMode = 'inspect' | 'select' | 'spot' | 'off'
 export const OVERLAY_MODES: readonly OverlayMode[] = ['inspect', 'select', 'spot', 'off']
 
-export type Capability = 'overlay' | 'values' | 'stega' | 'pins' | 'links' | 'refresh'
+export type Capability =
+  | 'overlay'
+  | 'values'
+  | 'stega'
+  | 'pins'
+  | 'links'
+  | 'refresh'
+  | 'scroll-sync'
+  | 'diff-marks'
+  | 'fragment-token'
 /** Every capability; a client built from this source advertises all of them. */
+/** The most capabilities a ready may list, known or not. */
+const MAX_CAPABILITIES = 32
+
 export const CAPABILITIES: readonly Capability[] = [
   'overlay',
   'values',
@@ -88,6 +117,9 @@ export const CAPABILITIES: readonly Capability[] = [
   'pins',
   'links',
   'refresh',
+  'scroll-sync',
+  'diff-marks',
+  'fragment-token',
 ]
 
 export {
@@ -267,6 +299,42 @@ export interface PausedPayload {
   count: number
 }
 
+/**
+ * A tagged field's element as a scroll anchor: the `nth` element of the field
+ * (in `TagIndex.byField` order, 0 first) and its top's distance below the
+ * viewport's top, CSS px (negative once it scrolled past).
+ */
+export interface ScrollAnchor {
+  recordRef: RecordRef
+  fieldKey: string
+  nth: number
+  offset: number
+}
+
+/**
+ * `zap:scroll` and `zap:scroll-to`: the scroll position as fractions (0..1) of
+ * the scrollable range (`x` only when the page scrolls sideways), and the
+ * field nearest the viewport's top, which aligns two pages of different
+ * lengths better than the fraction does.
+ */
+export interface ScrollPayload {
+  y: number
+  x?: number
+  anchor?: ScrollAnchor
+}
+
+/**
+ * One Comparar mark (`zap:marks`): every element of the field gets a box in
+ * its tone, red for `removed` (the published page), green for `added` (the
+ * draft); `active` (the change picked in the list) is solid, tinted and
+ * named with `label`.
+ */
+export interface DiffMark extends FieldRefPayload {
+  tone: 'removed' | 'added'
+  label: string
+  active?: boolean
+}
+
 export interface PageMessages {
   'zap:ready': ReadyPayload
   'zap:tags': TagSummary[]
@@ -277,6 +345,8 @@ export interface PageMessages {
   'zap:spot': SpotPayload
   'zap:pin': { id: string }
   'zap:paused': PausedPayload
+  /** `scroll-sync`: the page scrolled (while sync is on); never for a `zap:scroll-to`. */
+  'zap:scroll': ScrollPayload
 }
 
 export interface EditorMessages {
@@ -293,6 +363,12 @@ export interface EditorMessages {
   'zap:refresh': Record<string, never>
   'zap:highlight': { anchors: DomAnchor[] }
   'zap:pins': { pins: Pin[] }
+  /** `scroll-sync`: start or stop reporting `zap:scroll`. */
+  'zap:scroll-sync': { enabled: boolean }
+  /** `scroll-sync`: place the page here (the anchor first), without a `zap:scroll` back. */
+  'zap:scroll-to': ScrollPayload
+  /** `diff-marks`: the marks to draw; an empty list clears them. */
+  'zap:marks': { marks: DiffMark[] }
 }
 
 export type PageMessageType = keyof PageMessages
@@ -445,6 +521,28 @@ function isFieldRef(value: unknown): value is FieldRefPayload & Record<string, u
   return isObject(value) && isRecordRef(value.recordRef) && isFieldKey(value.fieldKey)
 }
 
+function isScrollPayload(value: unknown): value is ScrollPayload {
+  if (!isObject(value) || !isFiniteNumber(value.y, 0, 1)) return false
+  if (value.x !== undefined && !isFiniteNumber(value.x, 0, 1)) return false
+  const anchor = value.anchor
+  return (
+    anchor === undefined ||
+    (isFieldRef(anchor) &&
+      Number.isInteger(anchor.nth) &&
+      isFiniteNumber(anchor.nth, 0, MAX_ANCHOR_NTH) &&
+      isFiniteNumber(anchor.offset, -1e7, 1e7))
+  )
+}
+
+export function isDiffMark(value: unknown): value is DiffMark {
+  return (
+    isFieldRef(value) &&
+    (value.tone === 'removed' || value.tone === 'added') &&
+    isString(value.label, MAX_MARK_LABEL) &&
+    (value.active === undefined || typeof value.active === 'boolean')
+  )
+}
+
 export function isPreviewValue(value: unknown): value is PreviewValue {
   if (value === null || typeof value === 'boolean') return true
   if (typeof value === 'string') return true
@@ -549,8 +647,11 @@ const PAGE_VALIDATORS: { [K in PageMessageType]: (p: unknown) => boolean } = {
     isObject(p) &&
     isString(p.version, 32) &&
     Array.isArray(p.capabilities) &&
-    p.capabilities.length <= CAPABILITIES.length &&
-    p.capabilities.every((c) => (CAPABILITIES as readonly unknown[]).includes(c)) &&
+    // A capability this editor does not know is IGNORED, never a refusal: a
+    // newer client on a site must not go dark against an editor that has not
+    // shipped its protocol yet (#953, 0.11.0 added two). Bounded all the same.
+    p.capabilities.length <= MAX_CAPABILITIES &&
+    p.capabilities.every((c) => isString(c, 32)) &&
     isHttpUrl(p.pageUrl) &&
     (p.draftRoute === undefined || p.draftRoute === null || isDraftRoutePath(p.draftRoute)),
   'zap:tags': (p) =>
@@ -595,6 +696,7 @@ const PAGE_VALIDATORS: { [K in PageMessageType]: (p: unknown) => boolean } = {
     (p.reason === 'runaway' || p.reason === 'cap') &&
     Number.isInteger(p.count) &&
     (p.count as number) >= 0,
+  'zap:scroll': isScrollPayload,
 }
 
 const EDITOR_VALIDATORS: { [K in EditorMessageType]: (p: unknown) => boolean } = {
@@ -635,6 +737,13 @@ const EDITOR_VALIDATORS: { [K in EditorMessageType]: (p: unknown) => boolean } =
   'zap:highlight': (p) => isObject(p) && isAnchorList(p.anchors, isDomAnchor),
   'zap:pins': (p) =>
     isObject(p) && Array.isArray(p.pins) && p.pins.length <= MAX_PINS && p.pins.every(isPin),
+  'zap:scroll-sync': (p) => isObject(p) && typeof p.enabled === 'boolean',
+  'zap:scroll-to': isScrollPayload,
+  'zap:marks': (p) =>
+    isObject(p) &&
+    Array.isArray(p.marks) &&
+    p.marks.length <= MAX_MARKS &&
+    p.marks.every(isDiffMark),
 }
 
 export const PAGE_MESSAGE_TYPES = /* @__PURE__ */ Object.keys(PAGE_VALIDATORS) as PageMessageType[]

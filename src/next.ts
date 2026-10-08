@@ -2,6 +2,9 @@ import { createElement } from 'react'
 
 import { ZapPreview as ClientZapPreview, type ZapPreviewProps } from './boot/component'
 import { isPreviewTokenShape } from './refs'
+import { safeRedirectPath } from './preview/draft-path'
+
+export { safeRedirectPath } from './preview/draft-path'
 
 /**
  * `@8ux-co/eelzap/next` — the draft-mode route, `isZapPreview()` and the
@@ -12,21 +15,29 @@ import { isPreviewTokenShape } from './refs'
  * import { cookies, draftMode } from 'next/headers'
  * import { createDraftModeRoute } from '@8ux-co/eelzap/next'
  *
- * export const GET = createDraftModeRoute({
+ * export const POST = createDraftModeRoute({
  *   siteKey: 'verdeorigen',
  *   apiKey: process.env.ZAP_SECRET_KEY!,
  *   draftMode,
  *   cookies,
  * })
+ * export const GET = POST
  * ```
  *
  * and `<ZapPreview siteKey="verdeorigen" />` in the root layout, which tells
  * Zap's editor the route's path (`zap:ready`, §2.5); the editor joins it to the
- * frame's verified origin and loads `{origin}{route}?token=…&path=…`.
+ * frame's verified origin. Clients advertising `fragment-token` opt into
+ * `{origin}{route}#token=…&path=…`; older clients keep query URLs.
+ * GET serves a tiny page and a same-origin script that clears the fragment
+ * and submits a form POST.
+ * Fragments never travel in HTTP request URLs or site request logs.
  *
  * ## What the route does, in order
  *
- * 1. Reads `token` and `path` from the query. A token not shaped like Zap's
+ * 1. Requires same-origin evidence for POST (Sec-Fetch-Site or Origin), then
+ *    reads `token` and `path` from the form body. Legacy GET query tokens
+ *    remain supported. A token not shaped like
+ *    Zap's
  *    (`zpt_` + 43 base64url characters) is refused (401) without a request.
  * 2. Refuses a `path` that could leave the site: it must start with one `/`,
  *    carry no backslash or control character, resolve to this request's own
@@ -50,7 +61,8 @@ import { isPreviewTokenShape } from './refs'
  *    Chrome keeps a partitioned (CHIPS) cookie under third-party cookie
  *    restrictions. Safari blocks frame cookies regardless; the client's
  *    cookieless fallback covers it (`previewHeaders` → `getValidPreviewToken`).
- * 5. Redirects (307) to `path`, WITHOUT the token, `Cache-Control: no-store`,
+ * 5. Redirects (303 after POST; 307 for legacy GET) to `path`, without the
+ *    token, `Cache-Control: no-store`,
  *    `Referrer-Policy: no-referrer`.
  *
  * `createDraftModeExitRoute` ends the preview: both cookies expired, same
@@ -102,6 +114,7 @@ export interface DraftModeRouteOptions {
 }
 
 export type DraftModeRefusal =
+  | 'cross_origin'
   | 'invalid_token'
   | 'invalid_path'
   | 'token_refused'
@@ -114,47 +127,17 @@ function refuse(status: number, error: DraftModeRefusal): Response {
   return Response.json({ error }, { status, headers: NO_STORE })
 }
 
-/** A 307 to `path` (already `safeRedirectPath`ed) that sets `cookies`. */
-function redirect(path: string, cookies: string[]): Response {
+/** A redirect to `path` (already `safeRedirectPath`ed) that sets `cookies`. */
+function redirect(path: string, cookies: string[], status = 307): Response {
   const headers = new Headers({ Location: path, ...NO_STORE })
   for (const cookie of cookies) headers.append('Set-Cookie', cookie)
-  return new Response(null, { status: 307, headers })
+  return new Response(null, { status, headers })
 }
 
 function requireKeys(options: { siteKey?: string; apiKey?: string } | undefined): void {
   if (!options?.siteKey || !options.apiKey) {
     throw new Error('eelzap/next: siteKey and apiKey (the site API key) are required')
   }
-}
-
-// eslint-disable-next-line no-control-regex
-const UNSAFE_PATH_CHARS = /[\u0000-\u001f\u007f\\]/
-
-/**
- * The path to redirect to, or null when it could leave the site. Returned
- * as path + query + hash, never absolute, so the `Location` stays on the
- * host the browser asked.
- */
-export function safeRedirectPath(raw: string | null, requestUrl: string): string | null {
-  const value = raw ?? '/'
-  if (value.length === 0 || value.length > 2048) return null
-  if (!value.startsWith('/') || value.startsWith('//')) return null
-  if (UNSAFE_PATH_CHARS.test(value)) return null
-  let base: URL
-  let target: URL
-  try {
-    base = new URL(requestUrl)
-    target = new URL(value, base)
-  } catch {
-    return null
-  }
-  if (target.origin !== base.origin) return null
-  // Dot segments can collapse into a leading `//` (`/.//evil.example`,
-  // `/a/..//evil.example`), and a `Location` of `//evil.example` is
-  // protocol-relative: another host. The resolved path must not start so.
-  if (target.pathname.startsWith('//')) return null
-  if (/zpt_/i.test(target.search) || /zpt_/i.test(target.hash)) return null
-  return `${target.pathname}${target.search}${target.hash}`
 }
 
 function cookieHeader(name: string, value: string, maxAge?: number): string {
@@ -206,13 +189,67 @@ async function validateWithZap(token: string, options: ZapValidationOptions): Pr
     : { ok: false, status: 502, code: null }
 }
 
+/** Static script: the token is read only in the browser, never reflected by the server. */
+const FRAGMENT_EXCHANGE_SCRIPT = `(() => {
+  const params = new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null, '', location.pathname);
+  const token = params.get('token');
+  if (!/^zpt_[A-Za-z0-9_-]{43}$/.test(token || '')) return;
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = location.pathname;
+  for (const [name, value] of [['token', token], ['path', params.get('path') ?? '/']]) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = name;
+    input.value = value;
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  form.submit();
+})();`
+
+function fragmentExchangeScript(): Response {
+  return new Response(FRAGMENT_EXCHANGE_SCRIPT, {
+    headers: { ...NO_STORE, 'Content-Type': 'application/javascript; charset=utf-8' },
+  })
+}
+
+function fragmentExchangePage(): Response {
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Zap preview</title></head><body>
+<script src="?script=1"></script><noscript>JavaScript is required to enter Zap preview.</noscript></body></html>`
+  return new Response(html, {
+    headers: {
+      ...NO_STORE,
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy':
+        "default-src 'none'; script-src 'self'; form-action 'self'; base-uri 'none'",
+    },
+  })
+}
+
 export function createDraftModeRoute(options: DraftModeRouteOptions) {
   requireKeys(options)
-  return async function GET(request: Request): Promise<Response> {
-    const url = new URL(request.url)
-    const token = url.searchParams.get('token')
+  const exchange = async (request: Request): Promise<Response> => {
+    let params: URLSearchParams | FormData
+    if (request.method === 'POST') {
+      const sameOrigin =
+        request.headers.get('sec-fetch-site') === 'same-origin' ||
+        request.headers.get('origin') === new URL(request.url).origin
+      if (!sameOrigin) return refuse(403, 'cross_origin')
+      try {
+        params = await request.formData()
+      } catch {
+        return refuse(401, 'invalid_token')
+      }
+    } else {
+      params = new URL(request.url).searchParams
+    }
+    const token = params.get('token')
     if (!isPreviewTokenShape(token)) return refuse(401, 'invalid_token')
-    const path = safeRedirectPath(url.searchParams.get('path'), request.url)
+    const rawPath = params.get('path')
+    if (rawPath !== null && typeof rawPath !== 'string') return refuse(400, 'invalid_path')
+    const path = safeRedirectPath(rawPath, request.url)
     if (path === null) return refuse(400, 'invalid_path')
 
     let verdict: ZapVerdict
@@ -242,7 +279,18 @@ export function createDraftModeRoute(options: DraftModeRouteOptions) {
       // with nothing to read drafts with.
       cookies.push(cookieHeader(NEXT_DRAFT_COOKIE, bypass, PREVIEW_COOKIE_MAX_AGE))
     }
-    return redirect(path, cookies)
+    return redirect(path, cookies, request.method === 'POST' ? 303 : 307)
+  }
+  return async function draftModeRoute(request: Request): Promise<Response> {
+    if (request.method === 'GET') {
+      const params = new URL(request.url).searchParams
+      if (params.get('script') === '1') return fragmentExchangeScript()
+      if (!params.has('token')) return fragmentExchangePage()
+      // Old sites keep using query transport until their SDK opts in.
+      return exchange(request)
+    }
+    if (request.method === 'POST') return exchange(request)
+    return new Response(null, { status: 405, headers: { ...NO_STORE, Allow: 'GET, POST' } })
   }
 }
 

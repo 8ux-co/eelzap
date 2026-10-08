@@ -55,7 +55,12 @@ function setup(
     fetch: fetchMock as unknown as typeof fetch,
   })
   const call = (query: string) => GET(new Request(`${SITE}/api/zap-preview?${query}`))
-  return { call, enable, fetchMock }
+  const post = (
+    body: BodyInit,
+    url = `${SITE}/api/zap-preview`,
+    headers: Record<string, string> = { 'Sec-Fetch-Site': 'same-origin' },
+  ) => GET(new Request(url, { method: 'POST', headers, body }))
+  return { call, post, enable, fetchMock }
 }
 
 const query = (token: string, path?: string) =>
@@ -66,6 +71,7 @@ describe('createDraftModeRoute: a valid token for this site', () => {
     const { call, enable, fetchMock } = setup()
     const response = await call(query(TOKEN, '/blog/hola?ref=zap'))
     expect(response.status).toBe(307)
+    expect(response.headers.get('deprecation')).toBeNull()
     expect(response.headers.get('location')).toBe('/blog/hola?ref=zap')
     expect(response.headers.get('location')).not.toContain('zpt_')
     expect(response.headers.get('cache-control')).toBe('no-store')
@@ -108,7 +114,6 @@ describe('createDraftModeRoute: a valid token for this site', () => {
 
 describe('createDraftModeRoute: refusals enable nothing', () => {
   it.each([
-    ['no token', ''],
     ['a malformed token', 'token=zpt_short'],
     ['a site key instead', 'token=secret_abc'],
   ])('%s → 401 without asking Zap', async (_name, q) => {
@@ -195,6 +200,128 @@ describe('createDraftModeRoute: refusals enable nothing', () => {
       expect(response.status).toBe(502)
       expect(enable).not.toHaveBeenCalled()
     }
+  })
+})
+
+describe('createDraftModeRoute: POST exchange', () => {
+  it.each([
+    {},
+    { 'Sec-Fetch-Site': 'cross-site', Origin: 'https://evil.example' },
+    { 'Sec-Fetch-Site': 'same-site' },
+    { Origin: 'null' },
+    { Origin: `${SITE}.evil.example` },
+    { Origin: `${SITE}/` },
+  ] as Array<Record<string, string>>)(
+    'refuses POST without same-origin evidence: %j',
+    async (headers) => {
+      const { post, enable, fetchMock } = setup()
+      const response = await post(
+        new URLSearchParams({ token: TOKEN, path: '/' }),
+        undefined,
+        headers,
+      )
+      expect(response.status).toBe(403)
+      expect(response.headers.getSetCookie()).toEqual([])
+      expect(enable).not.toHaveBeenCalled()
+      expect(fetchMock).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    { 'Sec-Fetch-Site': 'same-origin' },
+    { Origin: SITE },
+    { 'Sec-Fetch-Site': 'same-site', Origin: SITE },
+  ] as Array<Record<string, string>>)(
+    'allows POST with same-origin evidence: %j',
+    async (headers) => {
+      const { post, enable } = setup()
+      const response = await post(
+        new URLSearchParams({ token: TOKEN, path: '/' }),
+        undefined,
+        headers,
+      )
+      expect(response.status).toBe(303)
+      expect(response.headers.getSetCookie()).toHaveLength(2)
+      expect(enable).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('reads only the body, validates with Zap and redirects with 303 so the token body is not replayed', async () => {
+    const { post, enable, fetchMock } = setup()
+    const response = await post(new URLSearchParams({ token: TOKEN, path: '/blog?ref=zap#note' }))
+    expect(response.status).toBe(303)
+    expect(response.headers.get('location')).toBe('/blog?ref=zap#note')
+    expect(response.headers.get('location')).not.toContain(TOKEN)
+    expect(response.headers.get('deprecation')).toBeNull()
+    expect(response.headers.get('cache-control')).toBe('no-store')
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer')
+    expect(enable).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).not.toContain(TOKEN)
+    expect(init.headers).toMatchObject({
+      Authorization: `Bearer ${TOKEN}`,
+      [SITE_API_KEY_HEADER]: SITE_API_KEY,
+    })
+    expect(response.headers.getSetCookie()).toHaveLength(2)
+    expect(response.headers.getSetCookie()[0]).toContain(`${PREVIEW_TOKEN_COOKIE}=${TOKEN}`)
+  })
+
+  it('defaults the body path to / and never falls back to query credentials', async () => {
+    const { post, enable } = setup()
+    expect((await post(new URLSearchParams({ token: TOKEN }))).headers.get('location')).toBe('/')
+    enable.mockClear()
+    const response = await post(
+      new URLSearchParams(),
+      `${SITE}/api/zap-preview?${query(TOKEN, '/')}`,
+    )
+    expect(response.status).toBe(401)
+    expect(enable).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    '//evil.example',
+    'https://evil.example',
+    '/\\evil.example',
+    '/.//evil.example',
+    '/a/..//evil.example',
+    '/%2e//evil.example',
+    '/blog\nnext',
+    `/blog?token=${TOKEN}`,
+    `/blog#${TOKEN}`,
+    `/${TOKEN}`,
+    `/blog?t=${TOKEN.replace('zpt_', 'z%70t_')}`,
+    `/blog?t=${TOKEN.replace('zpt_', '%257Apt_')}`,
+  ])('refuses unsafe or token-bearing body path %s before validation', async (path) => {
+    const { post, enable, fetchMock } = setup()
+    const response = await post(new URLSearchParams({ token: TOKEN, path }))
+    expect(response.status).toBe(400)
+    expect(await response.json()).toEqual({ error: 'invalid_path' })
+    expect(response.headers.get('location')).toBeNull()
+    expect(enable).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([new URLSearchParams(), new URLSearchParams({ token: 'zpt_short' }), 'not a form'])(
+    'refuses malformed bodies without enabling drafts',
+    async (body) => {
+      const { post, enable, fetchMock } = setup()
+      expect((await post(body)).status).toBe(401)
+      expect(enable).not.toHaveBeenCalled()
+      expect(fetchMock).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    [{ status: 401 }, 401],
+    [{ siteKey: 'another-site' }, 403],
+    [{ status: 403, code: 'WRONG_SITE' }, 403],
+    [{ throws: true }, 502],
+  ] as const)('still enforces token/site validation for POST: %j', async (answer, status) => {
+    const { post, enable } = setup(answer)
+    const response = await post(new URLSearchParams({ token: TOKEN, path: '/' }))
+    expect(response.status).toBe(status)
+    expect(response.headers.getSetCookie()).toEqual([])
+    expect(enable).not.toHaveBeenCalled()
   })
 })
 

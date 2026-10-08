@@ -1,6 +1,6 @@
 {
   "name": "@8ux-co/eelzap",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "description": "The Eel Zap client: typed content delivery and writes, stega-aware field helpers, Next.js and React preview helpers, and the on-demand preview overlay.",
   "license": "MIT",
   "repository": {
@@ -72,13 +72,13 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
+    "prepublishOnly": "node scripts/preflight-cdn.mjs && npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "docs": "typedoc",
-    "clean": "rm -rf dist coverage .turbo docs",
-    "prepublishOnly": "npm run build"
+    "clean": "rm -rf dist coverage .turbo docs"
   },
   "peerDependencies": {
     "next": ">=14",
@@ -99,8 +99,8 @@
     "@vitest/coverage-v8": "^3.2.4",
     "esbuild": "^0.27.7",
     "jsdom": "^29.1.1",
-    "react": "19.2.4",
-    "react-dom": "19.2.4",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
     "tsup": "^8.5.0",
     "typedoc": "^0.28.13",
     "typedoc-plugin-markdown": "^4.9.0",
